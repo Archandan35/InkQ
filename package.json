@@ -1,0 +1,27 @@
+{
+  "name": "inkq",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k -n api,ui -c blue,green \"npm:server\" \"vite\"",
+    "build": "vite build",
+    "preview": "vite preview",
+    "server": "node server.mjs",
+    "app": "npm run build && npm run server"
+  },
+  "dependencies": {
+    "@napi-rs/canvas": "^1.0.6",
+    "express": "^4.21.2",
+    "jspdf": "^4.2.1",
+    "jszip": "^3.10.1",
+    "pdfjs-dist": "^6.2.108",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.2",
+    "vite": "^5.4.11"
+  }
+}
