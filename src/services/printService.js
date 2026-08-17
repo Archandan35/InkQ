@@ -1,3 +1,4 @@
+import { sanitizeHtml } from './sanitizeHtml.js';
 import { loadImage, composeDataURL } from './imageOps.js';
 
 const A4_W_MM = 210;
@@ -63,7 +64,7 @@ function sanitizeSpaces(spaces, pageId) {
 
 function scaleContentHtml(html, scale) {
   const d = document.createElement('div');
-  d.innerHTML = html || '';
+  d.innerHTML = sanitizeHtml(html);
   const walker = document.createTreeWalker(d, NodeFilter.SHOW_ELEMENT);
   while (walker.nextNode()) {
     const el = walker.currentNode;

@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@napi-rs/canvas": "^1.0.6",
+    "dompurify": "^3.4.13",
     "express": "^4.21.2",
     "jspdf": "^4.2.1",
     "jszip": "^3.10.1",
@@ -22,6 +23,6 @@
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.4",
     "concurrently": "^9.1.2",
-    "vite": "^5.4.11"
+    "vite": "^6.4.3"
   }
 }

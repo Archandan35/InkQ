@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { sanitizeHtml } from '../services/sanitizeHtml.js';
 
 import Button from '../components/Button.jsx';
 import {
@@ -672,7 +673,7 @@ function SpaceContent({ space, onChange, contentRef, editorOpen }) {
         const sel = node.ownerDocument.getSelection();
         const editing = node === node.ownerDocument.activeElement || (sel && sel.rangeCount > 0 && node.contains(sel.anchorNode));
         if (editing) return;
-        node.innerHTML = clean;
+        node.innerHTML = sanitizeHtml(clean);
     }, [space.text]);
 
     const stripPasteBackgrounds = (html) => {
@@ -712,15 +713,15 @@ function SpaceContent({ space, onChange, contentRef, editorOpen }) {
         if (!node) return;
         node.focus();
         if (html && html.trim()) {
-            const safe = stripPasteBackgrounds(html).replace(/<\s*(script|style|iframe|object|embed)[\s\S]*?<\s*\/\s*\1\s*>/gi, '');
+            const safe = sanitizeHtml(stripPasteBackgrounds(html));
             document.execCommand('insertHTML', false, safe);
-            onChange(space.id, { text: node.innerHTML, dirty: true });
+            onChange(space.id, { text: sanitizeHtml(node.innerHTML), dirty: true });
             return;
         }
         if (!text) return;
         const safeText = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
         document.execCommand('insertHTML', false, `<span style="color:#84cc16">${safeText}</span>`);
-        onChange(space.id, { text: node.innerHTML, dirty: true });
+        onChange(space.id, { text: sanitizeHtml(node.innerHTML), dirty: true });
     };
 
     return (
@@ -732,7 +733,7 @@ function SpaceContent({ space, onChange, contentRef, editorOpen }) {
             className="space-content"
             contentEditable
             suppressContentEditableWarning
-            onInput={(e) => onChange(space.id, { text: e.currentTarget.innerHTML, dirty: true })}
+            onInput={(e) => onChange(space.id, { text: sanitizeHtml(e.currentTarget.innerHTML), dirty: true })}
             onPaste={handlePaste}
             onPointerDown={(e) => {
                 e.stopPropagation();
@@ -1266,7 +1267,7 @@ export default function StepReview({ pages, onUpdatePages, scanning, onScan, onU
     const applyFormat = () => {
         const node = activeSpaceRef.current;
         if (!node || !activeSpaceId) return;
-        updateSpace(activeSpaceId, { text: node.innerHTML, dirty: true });
+        updateSpace(activeSpaceId, { text: sanitizeHtml(node.innerHTML), dirty: true });
     };
 
     const startSpaceDrag = (type, id, e) => {

@@ -12,6 +12,92 @@ const PORT = process.env.PORT || 3001;
 
 app.use(express.json({ limit: '100mb' }));
 
+function isLoopbackHostname(hostname) {
+  const h = String(hostname || '').replace(/^\[|\]$/g, '').toLowerCase();
+  return h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '0.0.0.0' || /^127\./.test(h);
+}
+
+function isTrustedRequest(req) {
+  const secFetchSite = req.headers['sec-fetch-site'];
+  if (secFetchSite && !['same-origin', 'same-site', 'none'].includes(secFetchSite)) {
+    return false;
+  }
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try {
+    const u = new URL(origin);
+    if (u.protocol === 'file:' || u.protocol === 'app:') return true;
+    if (isLoopbackHostname(u.hostname)) return true;
+    if (u.host === req.headers.host) return true;
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+app.use('/api', (req, res, next) => {
+  if (isTrustedRequest(req)) return next();
+  return res.status(403).json({ error: 'Forbidden' });
+});
+
+const CSP =
+  "default-src 'self'; " +
+  "script-src 'self'; " +
+  "style-src 'self' 'unsafe-inline'; " +
+  "img-src 'self' data: blob:; " +
+  "font-src 'self' data:; " +
+  "connect-src 'self' data: blob:; " +
+  "worker-src 'self' blob:; " +
+  "frame-src 'self' data: blob: about:; " +
+  "object-src 'none'; " +
+  "base-uri 'self'; " +
+  "form-action 'self'; " +
+  "frame-ancestors 'none'";
+
+app.use((_req, res, next) => {
+  res.setHeader('Content-Security-Policy', CSP);
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), usb=(), serial=(), payment=(), magnetometer=(), gyroscope=()');
+  next();
+});
+
+app.use('/api', (req, res, next) => {
+  const started = Date.now();
+  res.on('finish', () => {
+    console.log(`[api] ${req.method} ${req.path} -> ${res.statusCode} (${Date.now() - started}ms)`);
+  });
+  next();
+});
+
+const rateBuckets = new Map();
+
+function rateLimit({ windowMs, max, name }) {
+  return (req, res, next) => {
+    const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+    const key = `${name}:${ip}`;
+    const now = Date.now();
+    const bucket = rateBuckets.get(key);
+    if (!bucket || now >= bucket.resetAt) {
+      rateBuckets.set(key, { count: 1, resetAt: now + windowMs });
+      return next();
+    }
+    bucket.count += 1;
+    if (bucket.count > max) {
+      return res.status(429).json({ error: 'Too many requests. Please wait a moment and try again.' });
+    }
+    return next();
+  };
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, b] of rateBuckets) {
+    if (now >= b.resetAt) rateBuckets.delete(k);
+  }
+}, 60000).unref();
+
 function mapStatus(p) {
   if (p.WorkOffline) return 'offline';
   switch (p.PrinterStatus) {
@@ -31,7 +117,7 @@ function getPrinters() {
       'Select-Object Name, PrinterStatus, WorkOffline, DriverName, Default | ' +
       'ConvertTo-Json -Compress';
     exec(
-      `powershell -NoProfile -ExecutionPolicy Bypass -Command "${ps}"`,
+      `powershell -NoProfile -Command "${ps}"`,
       { maxBuffer: 1024 * 1024, windowsHide: true },
       (err, stdout) => {
         if (err) return reject(err);
@@ -57,7 +143,7 @@ function getPrinters() {
   });
 }
 
-app.get('/api/printers', (_req, res) => {
+app.get('/api/printers', rateLimit({ windowMs: 60000, max: 30, name: 'printers' }), (_req, res) => {
   getPrinters()
     .then((printers) => res.json(printers))
     .catch(() => res.status(500).json({ error: 'Failed to enumerate printers' }));
@@ -99,7 +185,7 @@ function scanOnce(printerName, dpi) {
   return new Promise((resolve, reject) => {
     const encoded = Buffer.from(SCAN_SCRIPT, 'utf16le').toString('base64');
     exec(
-      `powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand ${encoded}`,
+      `powershell -NoProfile -EncodedCommand ${encoded}`,
       { maxBuffer: 1024 * 1024, timeout: 120000, windowsHide: true, env: { ...process.env, INKQ_PRINTER: printerName || '', INKQ_DPI: dpi || '' } },
       (err, stdout) => {
         if (err) return reject(err);
@@ -125,9 +211,16 @@ function scanWithRetry(printerName, dpi, attempts = 3) {
 
 let scanAborted = false;
 
-app.post('/api/scan', (req, res) => {
-  const printer = req.body?.printer || null;
-  const dpi = Number(req.body?.dpi) || 0;
+app.post('/api/scan', rateLimit({ windowMs: 60000, max: 5, name: 'scan' }), (req, res) => {
+  const printer = typeof req.body?.printer === 'string' ? req.body.printer.trim() : null;
+  if (printer && (printer.length > 200 || /[\r\n]/.test(printer))) {
+    return res.status(400).json({ error: 'Invalid printer name' });
+  }
+  const rawDpi = req.body?.dpi;
+  const dpi = rawDpi === undefined || rawDpi === null || rawDpi === '' ? 0 : Number(rawDpi);
+  if (dpi !== 0 && (Number.isNaN(dpi) || dpi < 50 || dpi > 2400)) {
+    return res.status(400).json({ error: 'Invalid DPI value (50–2400)' });
+  }
   const started = Date.now();
   scanAborted = false;
   scanWithRetry(printer, dpi)
@@ -145,13 +238,13 @@ app.post('/api/scan', (req, res) => {
     .catch((e) => {
       const msg = e.noScanner
         ? 'No scanner device found. Connect a scanner (or all-in-one printer) and try again.'
-        : `Scan failed: ${e.message || e}`;
+        : 'Scan failed. Please check the scanner connection and try again.';
       console.error('[scan] error:', e.message || e);
       res.status(500).json({ error: msg });
     });
 });
 
-app.post('/api/scan/cancel', (_req, res) => {
+app.post('/api/scan/cancel', rateLimit({ windowMs: 60000, max: 20, name: 'cancel' }), (_req, res) => {
   scanAborted = true;
   res.json({ ok: true });
 });
@@ -165,15 +258,31 @@ async function renderPdfPages(pdfPath) {
   const fontsDir = fontsFile.slice(0, fontsFile.lastIndexOf('/') + 1);
   pdfjs.GlobalWorkerOptions.workerSrc = workerSrc;
 
+  const MAX_PDF_PAGES = 200;
+  const MAX_CANVAS_PIXELS = 50_000_000;
   const data = new Uint8Array(readFileSync(pdfPath));
   const task = pdfjs.getDocument({ data, standardFontDataUrl: fontsDir });
   const doc = await task.promise;
+  if (doc.numPages > MAX_PDF_PAGES) {
+    await task.destroy();
+    const e = new Error(`PDF has ${doc.numPages} pages; maximum supported is ${MAX_PDF_PAGES}`);
+    e.maxPages = true;
+    throw e;
+  }
   const pages = [];
   try {
     for (let i = 1; i <= doc.numPages; i++) {
       const page = await doc.getPage(i);
       const vp = page.getViewport({ scale: 1.5 });
-      const canvas = createCanvas(Math.floor(vp.width), Math.floor(vp.height));
+      const w = Math.floor(vp.width);
+      const h = Math.floor(vp.height);
+      if (w <= 0 || h <= 0 || w * h > MAX_CANVAS_PIXELS) {
+        await task.destroy();
+        const e = new Error(`Page ${i} is too large to render (${w}x${h}px). Maximum allowed is ${MAX_CANVAS_PIXELS} pixels.`);
+        e.maxPages = true;
+        throw e;
+      }
+      const canvas = createCanvas(w, h);
       const ctx = canvas.getContext('2d');
       ctx.fillStyle = '#ffffff';
       ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -206,7 +315,7 @@ Write-Output 'OK'
 `;
     const encoded = Buffer.from(ps, 'utf16le').toString('base64');
     exec(
-      `powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand ${encoded}`,
+      `powershell -NoProfile -EncodedCommand ${encoded}`,
       { timeout: 120000, windowsHide: true },
       (err) => {
         if (err) return reject(new Error('Could not convert the Word document (is Microsoft Word installed?)'));
@@ -216,7 +325,16 @@ Write-Output 'OK'
   });
 }
 
-app.post('/api/upload', async (req, res) => {
+function sniffImageMime(buf) {
+  if (buf.length > 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'image/png';
+  if (buf.length > 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
+  if (buf.length > 4 && buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38) return 'image/gif';
+  if (buf.length > 2 && buf[0] === 0x42 && buf[1] === 0x4d) return 'image/bmp';
+  if (buf.length > 12 && buf.toString('latin1', 0, 4) === 'RIFF' && buf.toString('latin1', 8, 12) === 'WEBP') return 'image/webp';
+  return null;
+}
+
+app.post('/api/upload', rateLimit({ windowMs: 60000, max: 10, name: 'upload' }), async (req, res) => {
   const { name = '', type = '', data } = req.body || {};
   if (!data) return res.status(400).json({ error: 'No file data received' });
 
@@ -234,7 +352,9 @@ app.post('/api/upload', async (req, res) => {
   let converted = tmp;
   try {
     if (type.startsWith('image/')) {
-      return res.json({ pages: [`data:${type || 'image/png'};base64,${data}`] });
+      const mime = sniffImageMime(buf);
+      if (!mime) return res.status(400).json({ error: 'Unsupported or invalid image file' });
+      return res.json({ pages: [`data:${mime};base64,${buf.toString('base64')}`] });
     }
     if (/\.(doc|docx)$/i.test(name)) {
       converted = await convertWordToPdf(tmp);
@@ -246,7 +366,8 @@ app.post('/api/upload', async (req, res) => {
     return res.status(400).json({ error: `Unsupported file type: ${name}` });
   } catch (e) {
     console.error('[upload] error:', e.message || e);
-    return res.status(500).json({ error: e.message || 'Upload failed' });
+    const msg = e.maxPages ? e.message : 'Failed to process the uploaded file. Please try a different file or format.';
+    return res.status(500).json({ error: msg });
   } finally {
     await rm(tmp, { force: true });
     if (converted !== tmp) await rm(converted, { force: true });
@@ -256,9 +377,29 @@ app.post('/api/upload', async (req, res) => {
 const dist = path.join(__dirname, 'dist');
 if (existsSync(dist)) {
   app.use(express.static(dist));
-  app.get('*', (_req, res) => res.sendFile(path.join(dist, 'index.html')));
+  app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api')) return next();
+    return res.sendFile(path.join(dist, 'index.html'));
+  });
 }
 
-app.listen(PORT, () => {
-  console.log(`InkQ API server running at http://localhost:${PORT}`);
+app.use('/api', (_req, res) => res.status(404).json({ error: 'Not found' }));
+
+app.use((err, _req, res, _next) => {
+  if (err && err.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'Request body too large' });
+  }
+  if (err && err.type && err.type.startsWith('entity.')) {
+    return res.status(400).json({ error: 'Invalid request body' });
+  }
+  if (err) {
+    console.error('[server] error:', err.message || err);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+const HOST = process.env.INKQ_HOST || '127.0.0.1';
+
+app.listen(PORT, HOST, () => {
+  console.log(`InkQ API server running at http://${HOST}:${PORT}`);
 });
