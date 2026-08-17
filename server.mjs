@@ -1,14 +1,103 @@
 import express from 'express';
-import { exec } from 'node:child_process';
-import { existsSync, unlink } from 'node:fs';
+import { execFile } from 'node:child_process';
+import {
+  existsSync,
+  unlink,
+  appendFileSync,
+  mkdirSync,
+  realpathSync,
+  writeFileSync,
+  readFileSync,
+} from 'node:fs';
 import { writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
+import { randomBytes, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+const LOG_DIR = path.join(__dirname, 'logs');
+const LOG_FILE = path.join(LOG_DIR, 'inkq.log');
+mkdirSync(LOG_DIR, { recursive: true });
+function writeLog(level, message) {
+  const line = `[${new Date().toISOString()}] ${level} ${message}\n`;
+  try {
+    appendFileSync(LOG_FILE, line);
+  } catch {
+    /* logging must never break requests */
+  }
+  if (level === 'ERROR') console.error(message);
+  else console.log(message);
+}
+
+const AUTH_TOKEN = randomBytes(32).toString('hex');
+const TOKEN_FILE = path.join(__dirname, '.inkq-token');
+try {
+  writeFileSync(TOKEN_FILE, AUTH_TOKEN, { mode: 0o600 });
+} catch {
+  /* dev proxy token file is best-effort */
+}
+
+const WORKSPACE = path.join(tmpdir(), 'InkQ-workspace');
+mkdirSync(WORKSPACE, { recursive: true });
+const WS_REAL = realpathSync(WORKSPACE);
+
+function assertInWorkspace(p) {
+  if (typeof p !== 'string' || !p) throw new Error('Invalid file path');
+  const dirReal = realpathSync(path.dirname(p));
+  const base = path.basename(p);
+  if (dirReal !== WS_REAL) throw new Error('File outside the InkQ workspace');
+  if (base !== p.slice(dirReal.length + 1) || base === '.' || base === '..') throw new Error('Invalid file name');
+  return p;
+}
+
+const EXT_ALLOW = /\.(png|jpe?g|gif|bmp|webp|pdf|doc|docx)$/i;
+
+const POWERSHELL_PATH = path.join(
+  process.env.SystemRoot || 'C:\\Windows',
+  'System32',
+  'WindowsPowerShell',
+  'v1.0',
+  'powershell.exe'
+);
+const CHILD_ENV = {
+  SystemRoot: process.env.SystemRoot,
+  SystemDrive: process.env.SystemDrive,
+  ComSpec: process.env.ComSpec,
+  PATHEXT: process.env.PATHEXT,
+  TEMP: process.env.TEMP,
+  TMP: process.env.TMP,
+  USERPROFILE: process.env.USERPROFILE,
+  APPDATA: process.env.APPDATA,
+  PROCESSOR_ARCHITECTURE: process.env.PROCESSOR_ARCHITECTURE,
+  PATH: path.join(process.env.SystemRoot || 'C:\\Windows', 'System32'),
+};
+function runPs(args, opts = {}) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      POWERSHELL_PATH,
+      ['-NoProfile', ...args],
+      {
+        maxBuffer: 1024 * 1024,
+        windowsHide: true,
+        cwd: __dirname,
+        env: { ...CHILD_ENV, ...opts.env },
+        timeout: opts.timeout,
+      },
+      (err, stdout, stderr) => {
+        if (err) {
+          const e = new Error(err.message);
+          e.stderr = String(stderr || '');
+          return reject(e);
+        }
+        resolve({ stdout: String(stdout || ''), stderr: String(stderr || '') });
+      }
+    );
+  });
+}
 
 app.use(express.json({ limit: '100mb' }));
 
@@ -40,6 +129,11 @@ app.use('/api', (req, res, next) => {
   return res.status(403).json({ error: 'Forbidden' });
 });
 
+app.use('/api', (req, res, next) => {
+  if (req.headers['x-inkq-token'] === AUTH_TOKEN) return next();
+  return res.status(401).json({ error: 'Unauthorized' });
+});
+
 const CSP =
   "default-src 'self'; " +
   "script-src 'self'; " +
@@ -66,7 +160,7 @@ app.use((_req, res, next) => {
 app.use('/api', (req, res, next) => {
   const started = Date.now();
   res.on('finish', () => {
-    console.log(`[api] ${req.method} ${req.path} -> ${res.statusCode} (${Date.now() - started}ms)`);
+    writeLog('INFO', `[api] ${req.method} ${req.path} -> ${res.statusCode} (${Date.now() - started}ms)`);
   });
   next();
 });
@@ -111,35 +205,22 @@ function mapStatus(p) {
 }
 
 function getPrinters() {
-  return new Promise((resolve, reject) => {
-    const ps =
-      'Get-CimInstance Win32_Printer | ' +
-      'Select-Object Name, PrinterStatus, WorkOffline, DriverName, Default | ' +
-      'ConvertTo-Json -Compress';
-    exec(
-      `powershell -NoProfile -Command "${ps}"`,
-      { maxBuffer: 1024 * 1024, windowsHide: true },
-      (err, stdout) => {
-        if (err) return reject(err);
-        if (!stdout || !stdout.trim()) return resolve([]);
-        try {
-          const data = JSON.parse(stdout.trim());
-          const list = Array.isArray(data) ? data : [data];
-          resolve(
-            list.map((p) => ({
-              id: `printer-${p.Name}`,
-              name: p.Name,
-              type: 'printer',
-              status: mapStatus(p),
-              default: !!p.Default,
-              driver: p.DriverName || '',
-            }))
-          );
-        } catch (e) {
-          reject(e);
-        }
-      }
-    );
+  const ps =
+    'Get-CimInstance Win32_Printer | ' +
+    'Select-Object Name, PrinterStatus, WorkOffline, DriverName, Default | ' +
+    'ConvertTo-Json -Compress';
+  return runPs(['-Command', ps]).then(({ stdout }) => {
+    if (!stdout || !stdout.trim()) return [];
+    const data = JSON.parse(stdout.trim());
+    const list = Array.isArray(data) ? data : [data];
+    return list.map((p) => ({
+      id: `printer-${p.Name}`,
+      name: p.Name,
+      type: 'printer',
+      status: mapStatus(p),
+      default: !!p.Default,
+      driver: p.DriverName || '',
+    }));
   });
 }
 
@@ -158,7 +239,7 @@ $dm = New-Object -ComObject WIA.DeviceManager
 $info = $null
 if ($printer) {
   try {
-    $info = $dm.DeviceInfos | Where-Object { $_.Type -eq 1 -and $_.Properties.Item('Name').Value -like "*$printer*" } | Select-Object -First 1
+    $info = $dm.DeviceInfos | Where-Object { $_.Type -eq 1 -and $_.Properties.Item('Name').Value -eq $printer } | Select-Object -First 1
   } catch {}
 }
 if (-not $info) {
@@ -176,29 +257,29 @@ if ($dpi) {
   try { $item.Properties.Item(6147).Value = [int]$dpi } catch {}
 }
 $img = $item.Transfer('{B96B3CAE-0728-11D3-9D7B-0000F81EF32E}')
-$tmp = Join-Path $env:TEMP ('inkq_scan_' + [guid]::NewGuid().ToString('N') + '.jpg')
+$tmp = Join-Path $env:INKQ_OUT_DIR ('inkq_scan_' + [guid]::NewGuid().ToString('N') + '.jpg')
 $img.SaveFile($tmp)
 Write-Output $tmp
 `;
 
 function scanOnce(printerName, dpi) {
-  return new Promise((resolve, reject) => {
-    const encoded = Buffer.from(SCAN_SCRIPT, 'utf16le').toString('base64');
-    exec(
-      `powershell -NoProfile -EncodedCommand ${encoded}`,
-      { maxBuffer: 1024 * 1024, timeout: 120000, windowsHide: true, env: { ...process.env, INKQ_PRINTER: printerName || '', INKQ_DPI: dpi || '' } },
-      (err, stdout) => {
-        if (err) return reject(err);
-        const out = (stdout || '').trim();
-        if (!out || out.includes(NO_SCANNER)) {
-          const e = new Error('No scanner device found on this device');
-          e.noScanner = true;
-          return reject(e);
-        }
-        const line = out.split(/\r?\n/).pop().trim();
-        resolve(line);
-      }
-    );
+  const encoded = Buffer.from(SCAN_SCRIPT, 'utf16le').toString('base64');
+  return runPs(['-EncodedCommand', encoded], {
+    timeout: 120000,
+    env: {
+      INKQ_PRINTER: printerName || '',
+      INKQ_DPI: dpi || '',
+      INKQ_OUT_DIR: WORKSPACE,
+    },
+  }).then(({ stdout }) => {
+    const out = (stdout || '').trim();
+    if (!out || out.includes(NO_SCANNER)) {
+      const e = new Error('No scanner device found on this device');
+      e.noScanner = true;
+      throw e;
+    }
+    const line = out.split(/\r?\n/).pop().trim();
+    return assertInWorkspace(line);
   });
 }
 
@@ -213,7 +294,7 @@ let scanAborted = false;
 
 app.post('/api/scan', rateLimit({ windowMs: 60000, max: 5, name: 'scan' }), (req, res) => {
   const printer = typeof req.body?.printer === 'string' ? req.body.printer.trim() : null;
-  if (printer && (printer.length > 200 || /[\r\n]/.test(printer))) {
+  if (printer && (printer.length > 200 || /[\r\n;|&<>`$()]/.test(printer))) {
     return res.status(400).json({ error: 'Invalid printer name' });
   }
   const rawDpi = req.body?.dpi;
@@ -239,7 +320,7 @@ app.post('/api/scan', rateLimit({ windowMs: 60000, max: 5, name: 'scan' }), (req
       const msg = e.noScanner
         ? 'No scanner device found. Connect a scanner (or all-in-one printer) and try again.'
         : 'Scan failed. Please check the scanner connection and try again.';
-      console.error('[scan] error:', e.message || e);
+      writeLog('ERROR', `[scan] error: ${e.message || e}`);
       res.status(500).json({ error: msg });
     });
 });
@@ -297,32 +378,25 @@ async function renderPdfPages(pdfPath) {
 }
 
 function convertWordToPdf(srcPath) {
-  return new Promise((resolve, reject) => {
-    const outPath = srcPath.replace(/\.(doc|docx)$/i, '') + '_converted.pdf';
-    const esc = (s) => s.replace(/'/g, "''");
-    const ps = `
+  const outPath = srcPath.replace(/\.(doc|docx)$/i, '') + '_converted.pdf';
+  const ps = `
 $ErrorActionPreference = 'Stop'
 $word = New-Object -ComObject Word.Application
 $word.Visible = $false
 try {
-  $doc = $word.Documents.Open('${esc(srcPath)}')
-  $doc.SaveAs2('${esc(outPath)}', 17)
+  $doc = $word.Documents.Open($env:INKQ_SRC)
+  $doc.SaveAs2($env:INKQ_OUT, 17)
   $doc.Close(0)
 } finally {
   $word.Quit()
 }
 Write-Output 'OK'
 `;
-    const encoded = Buffer.from(ps, 'utf16le').toString('base64');
-    exec(
-      `powershell -NoProfile -EncodedCommand ${encoded}`,
-      { timeout: 120000, windowsHide: true },
-      (err) => {
-        if (err) return reject(new Error('Could not convert the Word document (is Microsoft Word installed?)'));
-        resolve(outPath);
-      }
-    );
-  });
+  const encoded = Buffer.from(ps, 'utf16le').toString('base64');
+  return runPs(['-EncodedCommand', encoded], {
+    timeout: 120000,
+    env: { INKQ_SRC: srcPath, INKQ_OUT: outPath },
+  }).then(() => outPath);
 }
 
 function sniffImageMime(buf) {
@@ -345,8 +419,8 @@ app.post('/api/upload', rateLimit({ windowMs: 60000, max: 10, name: 'upload' }),
     return res.status(400).json({ error: 'Invalid file data' });
   }
 
-  const ext = path.extname(name) || '.bin';
-  const tmp = path.join(tmpdir(), `inkq_upload_${Date.now()}_${Math.random().toString(36).slice(2)}${ext}`);
+  const ext = EXT_ALLOW.test(name) ? path.extname(name).toLowerCase() : '.bin';
+  const tmp = path.join(WORKSPACE, `inkq_upload_${randomUUID()}${ext}`);
   await writeFile(tmp, buf);
 
   let converted = tmp;
@@ -365,7 +439,7 @@ app.post('/api/upload', rateLimit({ windowMs: 60000, max: 10, name: 'upload' }),
     }
     return res.status(400).json({ error: `Unsupported file type: ${name}` });
   } catch (e) {
-    console.error('[upload] error:', e.message || e);
+    writeLog('ERROR', `[upload] error: ${e.message || e}`);
     const msg = e.maxPages ? e.message : 'Failed to process the uploaded file. Please try a different file or format.';
     return res.status(500).json({ error: msg });
   } finally {
@@ -375,11 +449,28 @@ app.post('/api/upload', rateLimit({ windowMs: 60000, max: 10, name: 'upload' }),
 });
 
 const dist = path.join(__dirname, 'dist');
+function serveIndex(_req, res) {
+  try {
+    let html = readFileSync(path.join(dist, 'index.html'), 'utf8');
+    if (!html.includes('name="inkq-token"')) {
+      html = html.replace('<head>', `<head><meta name="inkq-token" content="${AUTH_TOKEN}">`);
+    }
+    res.type('html').send(html);
+  } catch {
+    res.status(500).json({ error: 'Server error' });
+  }
+}
 if (existsSync(dist)) {
+  app.use((req, res, next) => {
+    if ((req.method !== 'GET' && req.method !== 'HEAD') || req.path.startsWith('/api') || path.extname(req.path)) {
+      return next();
+    }
+    return serveIndex(req, res);
+  });
   app.use(express.static(dist));
   app.get('*', (req, res, next) => {
     if (req.path.startsWith('/api')) return next();
-    return res.sendFile(path.join(dist, 'index.html'));
+    return serveIndex(req, res);
   });
 }
 
@@ -393,7 +484,7 @@ app.use((err, _req, res, _next) => {
     return res.status(400).json({ error: 'Invalid request body' });
   }
   if (err) {
-    console.error('[server] error:', err.message || err);
+    writeLog('ERROR', `[server] error: ${err.message || err}`);
     return res.status(500).json({ error: 'Server error' });
   }
 });
@@ -401,5 +492,5 @@ app.use((err, _req, res, _next) => {
 const HOST = process.env.INKQ_HOST || '127.0.0.1';
 
 app.listen(PORT, HOST, () => {
-  console.log(`InkQ API server running at http://${HOST}:${PORT}`);
+  writeLog('INFO', `InkQ API server running at http://${HOST}:${PORT}`);
 });

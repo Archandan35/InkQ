@@ -1,3 +1,5 @@
+import { apiHeaders } from './api.js';
+
 const STATUS_MAP = {
   online: 'online',
   offline: 'offline',
@@ -33,7 +35,7 @@ export async function listPrinters() {
 
   // 2. Fallback: local backend endpoint.
   try {
-    const res = await fetch('/api/printers', { headers: { Accept: 'application/json' } });
+    const res = await fetch('/api/printers', { headers: apiHeaders({ Accept: 'application/json' }) });
     if (res.ok) return { printers: normalize(await res.json()), reachable: true };
     return { printers: [], reachable: false };
   } catch {

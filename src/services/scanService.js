@@ -1,7 +1,9 @@
+import { apiHeaders } from './api.js';
+
 export async function scanPage(printerName, dpi, { signal } = {}) {
   const res = await fetch('/api/scan', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: apiHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ printer: printerName || null, dpi: dpi || null }),
     signal,
   });

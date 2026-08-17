@@ -1,3 +1,5 @@
+import { apiHeaders } from './api.js';
+
 function fileToBase64(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -15,7 +17,7 @@ export async function uploadDocument(file) {
   const data = await fileToBase64(file);
   const res = await fetch('/api/upload', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: apiHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ name: file.name, type: file.type, data }),
   });
 

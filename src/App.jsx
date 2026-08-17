@@ -7,6 +7,7 @@ import StepScan from './steps/StepScan.jsx';
 import StepReview from './steps/StepReview.jsx';
 import { scanPage } from './services/scanService.js';
 import { uploadDocument } from './services/uploadService.js';
+import { apiHeaders } from './services/api.js';
 
 const DESIGN_W = 1700;
 const DESIGN_H = 796;
@@ -108,7 +109,7 @@ export default function App() {
       scanAbortRef.current = null;
     }
     try {
-      await fetch('/api/scan/cancel', { method: 'POST' });
+      await fetch('/api/scan/cancel', { method: 'POST', headers: apiHeaders() });
     } catch {
       /* server may already be gone */
     }

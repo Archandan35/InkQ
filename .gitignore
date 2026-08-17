@@ -5,5 +5,6 @@ dist
 !.env.example
 *.log
 logs
+.inkq-token
 .DS_Store
 Thumbs.db
