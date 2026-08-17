@@ -453,7 +453,12 @@ app.post('/api/upload', rateLimit({ windowMs: 60000, max: 10, name: 'upload' }),
 });
 
 const dist = path.join(__dirname, 'dist');
-function serveIndex(_req, res) {
+const SENSITIVE_PATH =
+  /(^|[/\\])\.[^/\\]*([/\\]|$)|(^|[/\\])(node_modules|logs|dist|src|md\s+folder|backup)([/\\]|$)|\.(sql|dump|zip|tar|gz|bak|backup|map|log|ps1|mjs|cjs)$|^\/?(package(-lock)?\.json|server\.mjs|vite\.config\.js)$/i;
+function serveIndex(req, res) {
+  if (SENSITIVE_PATH.test(req.path)) {
+    return res.status(404).json({ error: 'Not found' });
+  }
   try {
     let html = readFileSync(path.join(dist, 'index.html'), 'utf8');
     if (!html.includes('name="inkq-token"')) {
