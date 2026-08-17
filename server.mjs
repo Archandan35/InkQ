@@ -148,12 +148,17 @@ const CSP =
   "form-action 'self'; " +
   "frame-ancestors 'none'";
 
-app.use((_req, res, next) => {
+app.use((req, res, next) => {
   res.setHeader('Content-Security-Policy', CSP);
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'no-referrer');
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), usb=(), serial=(), payment=(), magnetometer=(), gyroscope=()');
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+  if (req.path.startsWith('/api')) {
+    res.setHeader('Cache-Control', 'no-store');
+  }
   next();
 });
 
@@ -464,6 +469,7 @@ function serveIndex(req, res) {
     if (!html.includes('name="inkq-token"')) {
       html = html.replace('<head>', `<head><meta name="inkq-token" content="${AUTH_TOKEN}">`);
     }
+    res.set('Cache-Control', 'no-store');
     res.type('html').send(html);
   } catch {
     res.status(500).json({ error: 'Server error' });
