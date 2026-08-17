@@ -42,7 +42,7 @@ try {
 }
 
 const WORKSPACE = path.join(tmpdir(), 'InkQ-workspace');
-mkdirSync(WORKSPACE, { recursive: true });
+mkdirSync(WORKSPACE, { recursive: true, mode: 0o700 });
 const WS_REAL = realpathSync(WORKSPACE);
 
 function assertInWorkspace(p) {
@@ -99,7 +99,7 @@ function runPs(args, opts = {}) {
   });
 }
 
-app.use(express.json({ limit: '100mb' }));
+app.use(express.json({ limit: '64mb' }));
 
 function isLoopbackHostname(hostname) {
   const h = String(hostname || '').replace(/^\[|\]$/g, '').toLowerCase();
@@ -418,10 +418,14 @@ app.post('/api/upload', rateLimit({ windowMs: 60000, max: 10, name: 'upload' }),
   } catch {
     return res.status(400).json({ error: 'Invalid file data' });
   }
+  const MAX_FILE_BYTES = 48 * 1024 * 1024;
+  if (buf.length === 0 || buf.length > MAX_FILE_BYTES) {
+    return res.status(413).json({ error: 'File is too large' });
+  }
 
   const ext = EXT_ALLOW.test(name) ? path.extname(name).toLowerCase() : '.bin';
   const tmp = path.join(WORKSPACE, `inkq_upload_${randomUUID()}${ext}`);
-  await writeFile(tmp, buf);
+  await writeFile(tmp, buf, { mode: 0o600 });
 
   let converted = tmp;
   try {
