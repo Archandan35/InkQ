@@ -1,5 +1,14 @@
 import { apiHeaders } from './api.js';
 
+export async function listScanners(refresh) {
+  const url = refresh ? '/api/scanners?refresh=1' : '/api/scanners';
+  const res = await fetch(url, { headers: apiHeaders({ Accept: 'application/json' }) });
+  if (!res.ok) return { scanners: [], reachable: false };
+  const data = await res.json();
+  const list = Array.isArray(data) ? data : data?.scanners;
+  return { scanners: Array.isArray(list) ? list : [], reachable: true };
+}
+
 export async function scanPage(printerName, dpi, { signal } = {}) {
   const res = await fetch('/api/scan', {
     method: 'POST',

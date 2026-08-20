@@ -48,6 +48,8 @@ import {
 import { rotateImage, enhanceImage, cropImage, loadImage } from '../services/imageOps.js';
 import { uploadDocument } from '../services/uploadService.js';
 import { analyzeSmartSpaces } from '../services/smartSpaceService.js';
+import { isLandscape as isPageLandscape, A4_W_MM, A4_H_MM } from '../services/pageGeometry.js';
+import { calibrateFraction } from '../services/pageCalibration.js';
 import DoodleCanvas from '../components/DoodleCanvas.jsx';
 import PrintOptionsModal from '../components/PrintOptionsModal.jsx';
 
@@ -662,6 +664,38 @@ function RichTextToolbar({ targetRef, onChange, disabled, boxId }) {
     );
 }
 
+// Shows where the box's text ACTUALLY ends (real wrapped-line height),
+// as opposed to the box's draggable resize-handle position, which is just
+// wherever it was last resized to and has no relationship to line count.
+// This is what should be ruler-read against physical paper — the resize
+// handle never will, because paper has no printed border to compare against.
+function SpaceEndMarker({ spaceId, mmPerPx }) {
+    const [heightPx, setHeightPx] = useState(0);
+
+    useEffect(() => {
+        const el = document.querySelector(`[data-sid="${spaceId}"] .space-content`);
+        if (!el) return undefined;
+        const measure = () => setHeightPx(el.scrollHeight);
+        measure();
+        const ro = new ResizeObserver(measure);
+        ro.observe(el);
+        const mo = new MutationObserver(measure);
+        mo.observe(el, { childList: true, subtree: true, characterData: true });
+        return () => {
+            ro.disconnect();
+            mo.disconnect();
+        };
+    }, [spaceId]);
+
+    if (!heightPx || !mmPerPx) return null;
+    const mm = heightPx * mmPerPx;
+    return (
+        <div className="space-end-marker" style={{ top: `${heightPx}px` }} title="Actual text end (what will print)">
+            <span className="space-end-label">{mm.toFixed(1)}mm</span>
+        </div>
+    );
+}
+
 function SpaceContent({ space, onChange, contentRef, editorOpen }) {
     const ref = useRef(null);
     const pointerRef = useRef(null);
@@ -842,22 +876,30 @@ export default function StepReview({ pages, onUpdatePages, scanning, onScan, onU
     const safeSelected = total ? Math.min(selected, total) : 1;
     const idx = safeSelected - 1;
     const currentSpaces = spaces
-      .filter((s) => s.pageId === pages[idx]?.id)
-      .sort((a, b) => a.y - b.y);
+        .filter((s) => s.pageId === pages[idx]?.id)
+        .sort((a, b) => a.y - b.y);
     const spaceEditorBox = spaceEditor ? currentSpaces.find((s) => s.id === spaceEditor.id) : null;
     const pageMargin = pageMargins[pages[idx]?.id];
     const side = applyAll ? marginSide : (pageMargin?.side ?? marginSide);
     const unit = applyAll ? marginUnit : (pageMargin?.unit ?? marginUnit);
     const size = applyAll ? marginSize : (pageMargin?.size ?? marginSize);
-    const physWcm = stage.w >= stage.h ? 29.7 : 21;
-    const pxPerCm = stage.w > 0 ? stage.w / physWcm : 0;
-    const scaleCm = pxPerCm;
-    const scaleMm = pxPerCm / 10;
-    const scaleXTicks = scaleCm > 0 ? Array.from({ length: Math.round(stage.w / scaleCm) + 1 }, (_, i) => i * scaleCm) : [];
-    const scaleYTicks = scaleCm > 0 ? Array.from({ length: Math.round(stage.h / scaleCm) + 1 }, (_, i) => i * scaleCm) : [];
-    const scaleXHalves = scaleCm > 0 && scaleXTicks.length > 1 ? Array.from({ length: scaleXTicks.length - 1 }, (_, i) => scaleXTicks[i] + scaleCm / 2) : [];
-    const scaleYHalves = scaleCm > 0 && scaleYTicks.length > 1 ? Array.from({ length: scaleYTicks.length - 1 }, (_, i) => scaleYTicks[i] + scaleCm / 2) : [];
-    const sizePx = unit === 'mm' ? size * 0.1 * pxPerCm : size * pxPerCm;
+    const natImg = imgRef.current;
+    const landscape = natImg && natImg.naturalWidth
+        ? isPageLandscape(natImg.naturalWidth, natImg.naturalHeight)
+        : stage.w >= stage.h; // fallback before the image has loaded/measured
+    const physWcm = (landscape ? A4_H_MM : A4_W_MM) / 10;
+    const physHcm = (landscape ? A4_W_MM : A4_H_MM) / 10;
+    const pxPerCmX = stage.w > 0 ? stage.w / physWcm : 0;
+    const pxPerCmY = stage.h > 0 ? stage.h / physHcm : 0;
+    const scaleCmX = pxPerCmX;
+    const scaleCmY = pxPerCmY;
+    const scaleMmX = pxPerCmX / 10;
+    const scaleMmY = pxPerCmY / 10;
+    const scaleXTicks = scaleCmX > 0 ? Array.from({ length: Math.round(stage.w / scaleCmX) + 1 }, (_, i) => i * scaleCmX) : [];
+    const scaleYTicks = scaleCmY > 0 ? Array.from({ length: Math.round(stage.h / scaleCmY) + 1 }, (_, i) => i * scaleCmY) : [];
+    const scaleXHalves = scaleCmX > 0 && scaleXTicks.length > 1 ? Array.from({ length: scaleXTicks.length - 1 }, (_, i) => scaleXTicks[i] + scaleCmX / 2) : [];
+    const scaleYHalves = scaleCmY > 0 && scaleYTicks.length > 1 ? Array.from({ length: scaleYTicks.length - 1 }, (_, i) => scaleYTicks[i] + scaleCmY / 2) : [];
+    const sizePx = unit === 'mm' ? size * 0.1 * pxPerCmX : size * pxPerCmX;
     const mL = side === 'left' ? sizePx : 0;
     const mR = side === 'right' ? sizePx : 0;
 
@@ -1287,7 +1329,7 @@ export default function StepReview({ pages, onUpdatePages, scanning, onScan, onU
             startY: e.clientY,
             orig: { x: space.x, y: space.y, w: space.width, h: space.height },
             rect,
-            scale: (zoom / 100) * appZoom,
+            scale: (zoom / 100) * fitScale * appZoom,
             snapSide,
         };
     };
@@ -1425,8 +1467,8 @@ export default function StepReview({ pages, onUpdatePages, scanning, onScan, onU
             y: manualBox.y / 100,
             width: manualBox.w / 100,
             height: manualBox.h / 100,
-            physicalWidth: +((manualBox.w / 100) * 21).toFixed(2),
-            physicalHeight: +((manualBox.h / 100) * 29.7).toFixed(2),
+            physicalWidth: +((manualBox.w / 100) * physWcm).toFixed(2),
+            physicalHeight: +((manualBox.h / 100) * physHcm).toFixed(2),
             confidence: 1,
             manual: true,
             text: '',
@@ -1522,6 +1564,19 @@ export default function StepReview({ pages, onUpdatePages, scanning, onScan, onU
             const svc = await import('../services/printService.js');
             const appZoom = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--app-zoom')) || 1;
             const ref = { widths: docWidthsRef.current, displayW: stage.w || 0, appZoom };
+            if (mode === 'scanned' || mode === 'whole' || mode === 'blocks') {
+                const scaleMm = (physWcm * 10) / (stage.w || physWcm * 10);
+                const spaceWmm = {};
+                if (holderRef.current) {
+                    holderRef.current.querySelectorAll('.space-box[data-sid]').forEach((box) => {
+                        const content = box.querySelector('.space-content');
+                        if (content && content.clientWidth > 0) {
+                            spaceWmm[box.dataset.sid] = content.clientWidth * scaleMm;
+                        }
+                    });
+                }
+                ref.spaceWmm = spaceWmm;
+            }
             const margin = { side, size, unit };
             if (mode === 'scanned') await svc.printScannedOnly(pages);
             else if (mode === 'whole') await svc.printWholePage(pages, spaces, ref, margin);
@@ -1644,117 +1699,117 @@ export default function StepReview({ pages, onUpdatePages, scanning, onScan, onU
                 <div className={`columns ${collapsed ? 'collapsed' : ''}`}>
                     <div className="main-col">
                         <div className="card pages-card">
-                        <div className="pages-title">
-                            {reorderMode ? (
-                                <div className="reorder-bar">
-                                    <span>Reorder Pages</span>
-                                    <button type="button" className="mini-btn" disabled={safeSelected <= 1} onClick={() => moveSelected(-1)}>
-                                        <IconArrowLeft size={14} />
-                                        Move Top
-                                    </button>
-                                    <button type="button" className="mini-btn" disabled={safeSelected >= total} onClick={() => moveSelected(1)}>
-                                        Move Bottom
-                                        <IconArrowRight size={14} />
-                                    </button>
-                                    <button type="button" className="mini-btn strong" onClick={() => setReorderMode(false)}>
-                                        <IconCheck size={13} strokeWidth={3} />
-                                        Done
-                                    </button>
-                                </div>
-                            ) : (
-                                <>Pages ({total})</>
-                            )}
-                        </div>
-                        <div className="pages-scroll">
-                            {total === 0 && (
-                                <div className="pages-empty">
-                                    No pages yet. Go to Scan &amp; Detect to scan your flatbed, or use Add Pages to scan more.
-                                </div>
-                            )}
-                            {pages.map((p, i) => (
-                                <div
-                                    key={p.id}
-                                    className={`thumb ${safeSelected === i + 1 ? 'selected' : ''} ${dragIndex === i ? 'dragging' : ''} ${overIndex === i && dragIndex !== null && dragIndex !== i ? 'over' : ''}`}
-                                    onClick={() => setSelected(i + 1)}
-                                    draggable
-                                    onDragStart={(e) => {
-                                        setDragIndex(i);
-                                        e.dataTransfer.effectAllowed = 'move';
-                                    }}
-                                    onDragOver={(e) => {
-                                        e.preventDefault();
-                                        setOverIndex(i);
-                                    }}
-                                    onDrop={(e) => {
-                                        e.preventDefault();
-                                        if (dragIndex !== null) handleReorder(dragIndex, i);
-                                        setDragIndex(null);
-                                        setOverIndex(null);
-                                    }}
-                                    onDragEnd={() => {
-                                        setDragIndex(null);
-                                        setOverIndex(null);
-                                    }}
-                                >
-                                    <div className="thumb-badge">{i + 1}</div>
-                                    <button
-                                        type="button"
-                                        className="thumb-delete"
-                                        title="Delete page"
-                                        onClick={(e) => {
-                                            e.stopPropagation();
-                                            handleDeleteAt(i);
+                            <div className="pages-title">
+                                {reorderMode ? (
+                                    <div className="reorder-bar">
+                                        <span>Reorder Pages</span>
+                                        <button type="button" className="mini-btn" disabled={safeSelected <= 1} onClick={() => moveSelected(-1)}>
+                                            <IconArrowLeft size={14} />
+                                            Move Top
+                                        </button>
+                                        <button type="button" className="mini-btn" disabled={safeSelected >= total} onClick={() => moveSelected(1)}>
+                                            Move Bottom
+                                            <IconArrowRight size={14} />
+                                        </button>
+                                        <button type="button" className="mini-btn strong" onClick={() => setReorderMode(false)}>
+                                            <IconCheck size={13} strokeWidth={3} />
+                                            Done
+                                        </button>
+                                    </div>
+                                ) : (
+                                    <>Pages ({total})</>
+                                )}
+                            </div>
+                            <div className="pages-scroll">
+                                {total === 0 && (
+                                    <div className="pages-empty">
+                                        No pages yet. Go to Scan &amp; Detect to scan your flatbed, or use Add Pages to scan more.
+                                    </div>
+                                )}
+                                {pages.map((p, i) => (
+                                    <div
+                                        key={p.id}
+                                        className={`thumb ${safeSelected === i + 1 ? 'selected' : ''} ${dragIndex === i ? 'dragging' : ''} ${overIndex === i && dragIndex !== null && dragIndex !== i ? 'over' : ''}`}
+                                        onClick={() => setSelected(i + 1)}
+                                        draggable
+                                        onDragStart={(e) => {
+                                            setDragIndex(i);
+                                            e.dataTransfer.effectAllowed = 'move';
+                                        }}
+                                        onDragOver={(e) => {
+                                            e.preventDefault();
+                                            setOverIndex(i);
+                                        }}
+                                        onDrop={(e) => {
+                                            e.preventDefault();
+                                            if (dragIndex !== null) handleReorder(dragIndex, i);
+                                            setDragIndex(null);
+                                            setOverIndex(null);
+                                        }}
+                                        onDragEnd={() => {
+                                            setDragIndex(null);
+                                            setOverIndex(null);
                                         }}
                                     >
-                                        <IconTrash size={12} />
-                                    </button>
-                                    <img className="thumb-img" src={p.src} alt={`Page ${i + 1}`} draggable={false} />
-                                </div>
-                            ))}
-                        </div>
-                    </div>
-
-                    <div className="card viewer-card">
-                        <div className="viewer-toolbar">
-                            <div className="viewer-label">Page {safeSelected} of {total}</div>
-                            <div className="toolbar-btns">
-                                {cropMode || manualMode ? (
-                                    <>
-                                        {manualMode ? (
-                                            <button type="button" className="tbtn strong" onClick={applyManual}>
-                                                <IconPlus size={15} />
-                                                Add Space
-                                            </button>
-                                        ) : (
-                                            <button type="button" className="tbtn strong" onClick={applyCrop} disabled={busy}>
-                                                <IconCheck size={15} strokeWidth={3} />
-                                                Apply Crop
-                                            </button>
-                                        )}
-                                        <button type="button" className="tbtn-cancel" onClick={manualMode ? cancelManual : cancelCrop}>
-                                            Cancel
-                                        </button>
-                                    </>
-                                ) : (
-                                    <>
+                                        <div className="thumb-badge">{i + 1}</div>
                                         <button
                                             type="button"
-                                            className={`tbtn ${scaleMode ? 'active' : ''}`}
-                                            title={scaleMode ? 'Hide scale ruler' : 'Show true-scale ruler (cm/mm grid) over the page'}
-                                            onClick={toggleScale}
+                                            className="thumb-delete"
+                                            title="Delete page"
+                                            onClick={(e) => {
+                                                e.stopPropagation();
+                                                handleDeleteAt(i);
+                                            }}
                                         >
-                                            <IconRuler size={16} />
+                                            <IconTrash size={12} />
                                         </button>
-                                        <div className="margin-controls">
+                                        <img className="thumb-img" src={p.src} alt={`Page ${i + 1}`} draggable={false} />
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+
+                        <div className="card viewer-card">
+                            <div className="viewer-toolbar">
+                                <div className="viewer-label">Page {safeSelected} of {total}</div>
+                                <div className="toolbar-btns">
+                                    {cropMode || manualMode ? (
+                                        <>
+                                            {manualMode ? (
+                                                <button type="button" className="tbtn strong" onClick={applyManual}>
+                                                    <IconPlus size={15} />
+                                                    Add Space
+                                                </button>
+                                            ) : (
+                                                <button type="button" className="tbtn strong" onClick={applyCrop} disabled={busy}>
+                                                    <IconCheck size={15} strokeWidth={3} />
+                                                    Apply Crop
+                                                </button>
+                                            )}
+                                            <button type="button" className="tbtn-cancel" onClick={manualMode ? cancelManual : cancelCrop}>
+                                                Cancel
+                                            </button>
+                                        </>
+                                    ) : (
+                                        <>
                                             <button
                                                 type="button"
-                                                className={`apply-switch ${applyAll ? 'on' : ''}`}
-                                                title={applyAll ? 'Applied to all pages' : 'Applied per page'}
-                                                onClick={() => setApplyAll((v) => !v)}
+                                                className={`tbtn ${scaleMode ? 'active' : ''}`}
+                                                title={scaleMode ? 'Hide scale ruler' : 'Show true-scale ruler (cm/mm grid) over the page'}
+                                                onClick={toggleScale}
                                             >
-                                                {applyAll ? <IconPages size={16} /> : <IconFileOff size={16} />}
+                                                <IconRuler size={16} />
                                             </button>
-                                            <div className="margin-toggle" title="off / left / right">
+                                            <div className="margin-controls">
+                                                <button
+                                                    type="button"
+                                                    className={`apply-switch ${applyAll ? 'on' : ''}`}
+                                                    title={applyAll ? 'Applied to all pages' : 'Applied per page'}
+                                                    onClick={() => setApplyAll((v) => !v)}
+                                                >
+                                                    {applyAll ? <IconPages size={16} /> : <IconFileOff size={16} />}
+                                                </button>
+                                                <div className="margin-toggle" title="off / left / right">
                                                     <span
                                                         className="margin-toggle-thumb"
                                                         style={{ transform: `translateX(${MARGIN_SIDES.indexOf(side) * 100}%)` }}
@@ -1821,271 +1876,275 @@ export default function StepReview({ pages, onUpdatePages, scanning, onScan, onU
                                                         </div>
                                                     )}
                                                 </div>
-                                        </div>
-                                        <button type="button" className="tbtn text" onClick={() => setAddOpen((v) => !v)} disabled={scanning}>
-                                            {scanning ? <IconScanner size={15} /> : <IconPlus size={15} />}
-                                            {scanning ? 'Scanning...' : 'Add Pages'}
-                                        </button>
-                                        {addOpen && (
-                                            <div className="add-menu" ref={addMenuRef}>
-                                                <button
-                                                    type="button"
-                                                    className="add-menu-item"
-                                                    onClick={() => {
-                                                        setAddOpen(false);
-                                                        onScan();
-                                                    }}
+                                            </div>
+                                            <button type="button" className="tbtn text" onClick={() => setAddOpen((v) => !v)} disabled={scanning}>
+                                                {scanning ? <IconScanner size={15} /> : <IconPlus size={15} />}
+                                                {scanning ? 'Scanning...' : 'Add Pages'}
+                                            </button>
+                                            {addOpen && (
+                                                <div className="add-menu" ref={addMenuRef}>
+                                                    <button
+                                                        type="button"
+                                                        className="add-menu-item"
+                                                        onClick={() => {
+                                                            setAddOpen(false);
+                                                            onScan();
+                                                        }}
+                                                    >
+                                                        <IconScanner size={16} />
+                                                        <span>
+                                                            Scan
+                                                            <small>Scan a page from your scanner</small>
+                                                        </span>
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        className="add-menu-item"
+                                                        onClick={() => addInputRef.current && addInputRef.current.click()}
+                                                    >
+                                                        <IconUpload size={16} />
+                                                        <span>
+                                                            Upload
+                                                            <small>Upload PDF or image files</small>
+                                                        </span>
+                                                    </button>
+                                                    <input
+                                                        ref={addInputRef}
+                                                        type="file"
+                                                        accept=".pdf,.jpg,.jpeg,.png,.doc,.docx"
+                                                        multiple
+                                                        hidden
+                                                        onChange={handleAddFiles}
+                                                    />
+                                                </div>
+                                            )}
+                                            <div className="tbtn" onClick={() => setZoom((z) => Math.min(200, z + 10))}><IconPlus size={16} /></div>
+                                            <div className="tbtn" onClick={() => setZoom((z) => Math.max(50, z - 10))}><IconMinus size={16} /></div>
+                                            <div className="tbtn" onClick={() => setZoom(100)}><IconExpand size={16} /></div>
+                                        </>
+                                    )}
+                                </div>
+                            </div>
+                            <div className={`viewer-canvas ${total ? 'has-img' : ''}`}>
+                                {total ? (
+                                    <div className="viewer-img-holder" ref={holderRef} style={{ transform: `scale(${(zoom / 100) * fitScale})`, ['--pxmm']: stage.w / (physWcm * 10) }} onPointerDown={() => setSpaceEditor(null)}>
+                                        <img
+                                            ref={imgRef}
+                                            className="viewer-img"
+                                            src={pages[idx].src}
+                                            alt={`Page ${safeSelected}`}
+                                        />
+                                        {doodleTool && stage.w > 0 && (
+                                            <DoodleCanvas
+                                                src={pages[idx].src}
+                                                ann={pages[idx].ann}
+                                                tool={doodleTool}
+                                                size={doodleSize}
+                                                color={doodleColor}
+                                                active
+                                                onSave={saveDoodle}
+                                                pos={stage}
+                                            />
+                                        )}
+                                        {cropMode && (
+                                            <div className="crop-layer">
+                                                <div
+                                                    className="crop-box"
+                                                    style={{ left: `${cropBox.x}%`, top: `${cropBox.y}%`, width: `${cropBox.w}%`, height: `${cropBox.h}%` }}
+                                                    onPointerDown={(e) => startCropDrag('move', e)}
                                                 >
-                                                    <IconScanner size={16} />
-                                                    <span>
-                                                        Scan
-                                                        <small>Scan a page from your scanner</small>
-                                                    </span>
-                                                </button>
-                                                <button
-                                                    type="button"
-                                                    className="add-menu-item"
-                                                    onClick={() => addInputRef.current && addInputRef.current.click()}
-                                                >
-                                                    <IconUpload size={16} />
-                                                    <span>
-                                                        Upload
-                                                        <small>Upload PDF or image files</small>
-                                                    </span>
-                                                </button>
-                                                <input
-                                                    ref={addInputRef}
-                                                    type="file"
-                                                    accept=".pdf,.jpg,.jpeg,.png,.doc,.docx"
-                                                    multiple
-                                                    hidden
-                                                    onChange={handleAddFiles}
-                                                />
+                                                    <div className="crop-handle" onPointerDown={(e) => startCropDrag('resize', e)} />
+                                                </div>
                                             </div>
                                         )}
-                                        <div className="tbtn" onClick={() => setZoom((z) => Math.min(200, z + 10))}><IconPlus size={16} /></div>
-                                        <div className="tbtn" onClick={() => setZoom((z) => Math.max(50, z - 10))}><IconMinus size={16} /></div>
-                                        <div className="tbtn" onClick={() => setZoom(100)}><IconExpand size={16} /></div>
-                                    </>
+                                        {manualMode && (
+                                            <div className="crop-layer">
+                                                <div
+                                                    className="crop-box manual"
+                                                    style={{ left: `${manualBox.x}%`, top: `${manualBox.y}%`, width: `${manualBox.w}%`, height: `${manualBox.h}%` }}
+                                                    onPointerDown={(e) => startManualDrag('move', e)}
+                                                >
+                                                    <span className="manual-hint">Drag &amp; resize, then press Add Space</span>
+                                                    <div className="crop-handle" onPointerDown={(e) => startManualDrag('resize', e)} />
+                                                </div>
+                                            </div>
+                                        )}
+                                        {!cropMode && !doodleTool && !manualMode && stage.w > 0 && currentSpaces.length > 0 && (
+                                            <div
+                                                className="space-layer"
+                                                style={{
+                                                    left: stage.x + mL,
+                                                    top: stage.y,
+                                                    width: stage.w - mL - mR,
+                                                    height: stage.h,
+                                                }}
+                                            >
+                                                {currentSpaces.map((s, boxIdx) => {
+                                                    const snap = side !== 'off' && s.pinned !== false;
+                                                    const effLeft = snap ? (side === 'left' ? 0 : 1 - s.width) : s.x;
+                                                    const calLeft = calibrateFraction(effLeft, physWcm * 10);
+                                                    const calTop = calibrateFraction(s.y, physHcm * 10);
+                                                    return (
+                                                        <div
+                                                            key={s.id}
+                                                            data-sid={s.id}
+                                                            className={`space-box ${activeSpaceId === s.id ? 'active' : ''}`}
+                                                            style={{ left: `${calLeft * 100}%`, top: `${calTop * 100}%`, width: `${s.width * 100}%`, height: `${s.height * 100}%` }}
+                                                            onPointerDown={(e) => startSpaceDrag('move', s.id, e)}
+                                                            onClick={() => {
+                                                                const wasOpen = !!spaceEditor;
+                                                                setActiveSpaceId(s.id);
+                                                                if (!wasOpen) {
+                                                                    const sel = document.getSelection();
+                                                                    if (sel && sel.rangeCount > 0) sel.removeAllRanges();
+                                                                }
+                                                                closeSpaceEditor();
+                                                            }}
+                                                            onContextMenu={(e) => {
+                                                                e.preventDefault();
+                                                                setActiveSpaceId(s.id);
+                                                                const p = stageViewportPx(e.clientX, e.clientY);
+                                                                const x = clamp(p.x, 8, Math.max(8, p.maxX - 340));
+                                                                const y = clamp(p.y, 8, Math.max(8, p.maxY - 120));
+                                                                setSpaceEditor({ id: s.id, x, y });
+                                                            }}
+                                                        >
+                                                            <span className="space-tag">{boxIdx + 1}</span>
+                                                            <SpaceContent
+                                                                space={s}
+                                                                onChange={updateSpace}
+                                                                editorOpen={!!spaceEditor}
+                                                                contentRef={activeSpaceId === s.id ? activeSpaceRef : undefined}
+                                                            />
+                                                            <SpaceEndMarker spaceId={s.id} mmPerPx={stage.h > 0 ? (physHcm * 10) / stage.h : 0} />
+                                                            <div className="space-tools">
+                                                                <button
+                                                                    type="button"
+                                                                    className={`space-tool apply ${s.dirty ? 'show' : ''}`}
+                                                                    title="Apply changes"
+                                                                    onPointerDown={(e) => e.stopPropagation()}
+                                                                    onClick={() => updateSpace(s.id, { dirty: false })}
+                                                                >
+                                                                    <IconCheck size={12} strokeWidth={3} />
+                                                                    Apply
+                                                                </button>
+                                                                <button
+                                                                    type="button"
+                                                                    className="space-tool del"
+                                                                    title="Delete box"
+                                                                    onPointerDown={(e) => e.stopPropagation()}
+                                                                    onClick={() => deleteSpace(s.id)}
+                                                                >
+                                                                    <IconTrash size={13} />
+                                                                </button>
+                                                            </div>
+                                                            <div
+                                                                className="space-resize"
+                                                                title="Resize box"
+                                                                onPointerDown={(e) => startSpaceDrag('resize', s.id, e)}
+                                                            />
+                                                            <div
+                                                                className="space-drag"
+                                                                title="Drag to move box"
+                                                                onPointerDown={(e) => {
+                                                                    e.stopPropagation();
+                                                                    startSpaceDrag('move', s.id, e);
+                                                                }}
+                                                                onClick={(e) => e.stopPropagation()}
+                                                            />
+                                                        </div>
+                                                    );
+                                                })}
+                                            </div>
+                                        )}
+                                        {!cropMode && !doodleTool && !manualMode && stage.w > 0 && side !== 'off' && sizePx > 0 && (
+                                            <div
+                                                className="margin-line"
+                                                style={{
+                                                    left: `${side === 'left' ? stage.x + sizePx : stage.x + stage.w - sizePx}px`,
+                                                    top: stage.y,
+                                                    height: stage.h,
+                                                }}
+                                            />
+                                        )}
+                                        {!cropMode && !doodleTool && !manualMode && scaleMode && stage.w > 0 && scaleCmX > 0 && scaleCmY > 0 && (
+                                            <div
+                                                className="scale-overlay"
+                                                style={{ left: stage.x, top: stage.y, width: stage.w, height: stage.h }}
+                                            >
+                                                <div
+                                                    className="scale-grid"
+                                                    style={{
+                                                        backgroundImage: [
+                                                            `repeating-linear-gradient(to right, rgba(106,50,240,0.05) 0px, rgba(106,50,240,0.05) 1px, transparent 1px, transparent ${scaleMmX}px)`,
+                                                            `repeating-linear-gradient(to bottom, rgba(106,50,240,0.05) 0px, rgba(106,50,240,0.05) 1px, transparent 1px, transparent ${scaleMmY}px)`,
+                                                            `repeating-linear-gradient(to right, rgba(106,50,240,0.15) 0px, rgba(106,50,240,0.15) 1px, transparent 1px, transparent ${scaleCmX}px)`,
+                                                            `repeating-linear-gradient(to bottom, rgba(106,50,240,0.15) 0px, rgba(106,50,240,0.15) 1px, transparent 1px, transparent ${scaleCmY}px)`,
+                                                        ].join(', '),
+                                                    }}
+                                                />
+                                                <div
+                                                    className="scale-axis-x"
+                                                    style={{
+                                                        backgroundImage: [
+                                                            `repeating-linear-gradient(to right, rgba(59,42,138,0.08) 0px, rgba(59,42,138,0.08) 1px, transparent 1px, transparent ${scaleMmX}px)`,
+                                                            `repeating-linear-gradient(to right, rgba(59,42,138,0.4) 0px, rgba(59,42,138,0.4) 1px, transparent 1px, transparent ${scaleCmX}px)`,
+                                                        ].join(', '),
+                                                    }}
+                                                >
+                                                    {scaleXTicks.map((left, i) => (
+                                                        <span key={i} className="scale-tick-x" style={{ left }}>
+                                                            <b style={left > stage.w - 26 ? { left: 'auto', right: 0 } : undefined}>{i}</b>
+                                                        </span>
+                                                    ))}
+                                                    {scaleXHalves.map((left, i) => (
+                                                        <span key={`h${i}`} className="scale-tick-h x" style={{ left }} />
+                                                    ))}
+                                                </div>
+                                                <div
+                                                    className="scale-axis-y"
+                                                    style={{
+                                                        backgroundImage: [
+                                                            `repeating-linear-gradient(to bottom, rgba(59,42,138,0.08) 0px, rgba(59,42,138,0.08) 1px, transparent 1px, transparent ${scaleMmY}px)`,
+                                                            `repeating-linear-gradient(to bottom, rgba(59,42,138,0.4) 0px, rgba(59,42,138,0.4) 1px, transparent 1px, transparent ${scaleCmY}px)`,
+                                                        ].join(', '),
+                                                    }}
+                                                >
+                                                    {scaleYTicks.map((top, i) => (
+                                                        <span key={i} className="scale-tick-y" style={{ top }}>
+                                                            <b style={top > stage.h - 26 ? { top: 'auto', bottom: 0 } : undefined}>{i}</b>
+                                                        </span>
+                                                    ))}
+                                                    {scaleYHalves.map((top, i) => (
+                                                        <span key={`h${i}`} className="scale-tick-h y" style={{ top }} />
+                                                    ))}
+                                                </div>
+                                                <span className="scale-note">1 cm grid · true scale · {(stage.w / scaleCmX).toFixed(1)} × {(stage.h / scaleCmY).toFixed(1)} cm</span>
+                                            </div>
+                                        )}
+                                    </div>
+                                ) : (
+                                    <div className="viewer-empty">
+                                        <div className="hand-line">
+                                            If &nbsp;
+                                            <span className="hand-frac"><span className="num">x</span><span className="bar"></span><span className="den">y</span></span>
+                                            = <span className="hand-frac"><span className="num">b</span><span className="bar"></span><span className="den">y</span></span>
+                                            = <span className="hand-frac"><span className="num">c</span><span className="bar"></span><span className="den">2</span></span>
+                                            , then,
+                                        </div>
+                                        <div className="hand-line">&nbsp;&nbsp;(a + b + c) ( 1/x + 1/y + 1/z ) = 0</div>
+                                        <div className="hand-line"><span className="underline">Sol</span>&nbsp; Let &nbsp;a/x = b/y = c/z = k</div>
+                                        <div className="hand-line">&nbsp;&nbsp;&nbsp;a = kx,&nbsp; b = ky,&nbsp; c = kz</div>
+                                        <div className="hand-line">LHS = (a + b + c) ( 1/x + 1/y + 1/z )</div>
+                                        <div className="hand-line">&nbsp;&nbsp;&nbsp;= k (x + y + z) ( (yz+zx+xy) / xyz )</div>
+                                        <div className="hand-line">&nbsp;&nbsp;&nbsp;= k (x + y + z) ( (xy+yz+zx) / xyz )</div>
+                                        <div className="hand-line">&nbsp;&nbsp;&nbsp;= k (x + y + z) ( (x+y+z) / xyz )</div>
+                                        <div className="hand-line">&nbsp;&nbsp;&nbsp;= k (x + y + z)&sup2; / xyz</div>
+                                        <div className="hand-line">&nbsp;&nbsp;&nbsp;= 0 &nbsp; ( since a/x = b/y = c/z = k = 0 )</div>
+                                    </div>
                                 )}
                             </div>
                         </div>
-                        <div className={`viewer-canvas ${total ? 'has-img' : ''}`}>
-                            {total ? (
-                                <div className="viewer-img-holder" ref={holderRef} style={{ transform: `scale(${(zoom / 100) * fitScale})` }} onPointerDown={() => setSpaceEditor(null)}>
-                                    <img
-                                        ref={imgRef}
-                                        className="viewer-img"
-                                        src={pages[idx].src}
-                                        alt={`Page ${safeSelected}`}
-                                    />
-                                    {doodleTool && stage.w > 0 && (
-                                        <DoodleCanvas
-                                            src={pages[idx].src}
-                                            ann={pages[idx].ann}
-                                            tool={doodleTool}
-                                            size={doodleSize}
-                                            color={doodleColor}
-                                            active
-                                            onSave={saveDoodle}
-                                            pos={stage}
-                                        />
-                                    )}
-                                    {cropMode && (
-                                        <div className="crop-layer">
-                                            <div
-                                                className="crop-box"
-                                                style={{ left: `${cropBox.x}%`, top: `${cropBox.y}%`, width: `${cropBox.w}%`, height: `${cropBox.h}%` }}
-                                                onPointerDown={(e) => startCropDrag('move', e)}
-                                            >
-                                                <div className="crop-handle" onPointerDown={(e) => startCropDrag('resize', e)} />
-                                            </div>
-                                        </div>
-                                    )}
-                                    {manualMode && (
-                                        <div className="crop-layer">
-                                            <div
-                                                className="crop-box manual"
-                                                style={{ left: `${manualBox.x}%`, top: `${manualBox.y}%`, width: `${manualBox.w}%`, height: `${manualBox.h}%` }}
-                                                onPointerDown={(e) => startManualDrag('move', e)}
-                                            >
-                                                <span className="manual-hint">Drag &amp; resize, then press Add Space</span>
-                                                <div className="crop-handle" onPointerDown={(e) => startManualDrag('resize', e)} />
-                                            </div>
-                                        </div>
-                                    )}
-                                    {!cropMode && !doodleTool && !manualMode && stage.w > 0 && currentSpaces.length > 0 && (
-                                        <div
-                                            className="space-layer"
-                                            style={{
-                                                left: stage.x + mL,
-                                                top: stage.y,
-                                                width: stage.w - mL - mR,
-                                                height: stage.h,
-                                            }}
-                                        >
-                                            {currentSpaces.map((s, boxIdx) => {
-                                                const snap = side !== 'off' && s.pinned !== false;
-                                                const effLeft = snap ? (side === 'left' ? 0 : 1 - s.width) : s.x;
-                                                return (
-                                                <div
-                                                    key={s.id}
-                                                    className={`space-box ${activeSpaceId === s.id ? 'active' : ''}`}
-                                                    style={{ left: `${effLeft * 100}%`, top: `${s.y * 100}%`, width: `${s.width * 100}%`, height: `${s.height * 100}%` }}
-                                                    onPointerDown={(e) => startSpaceDrag('move', s.id, e)}
-                                                    onClick={() => {
-                                                        const wasOpen = !!spaceEditor;
-                                                        setActiveSpaceId(s.id);
-                                                        if (!wasOpen) {
-                                                            const sel = document.getSelection();
-                                                            if (sel && sel.rangeCount > 0) sel.removeAllRanges();
-                                                        }
-                                                        closeSpaceEditor();
-                                                    }}
-                                                    onContextMenu={(e) => {
-                                                        e.preventDefault();
-                                                        setActiveSpaceId(s.id);
-                                                        const p = stageViewportPx(e.clientX, e.clientY);
-                                                        const x = clamp(p.x, 8, Math.max(8, p.maxX - 340));
-                                                        const y = clamp(p.y, 8, Math.max(8, p.maxY - 120));
-                                                        setSpaceEditor({ id: s.id, x, y });
-                                                    }}
-                                                >
-                                                    <span className="space-tag">{boxIdx + 1}</span>
-                                                    <SpaceContent
-                                                        space={s}
-                                                        onChange={updateSpace}
-                                                        editorOpen={!!spaceEditor}
-                                                        contentRef={activeSpaceId === s.id ? activeSpaceRef : undefined}
-                                                    />
-                                                    <div className="space-tools">
-                                                        <button
-                                                            type="button"
-                                                            className={`space-tool apply ${s.dirty ? 'show' : ''}`}
-                                                            title="Apply changes"
-                                                            onPointerDown={(e) => e.stopPropagation()}
-                                                            onClick={() => updateSpace(s.id, { dirty: false })}
-                                                        >
-                                                            <IconCheck size={12} strokeWidth={3} />
-                                                            Apply
-                                                        </button>
-                                                        <button
-                                                            type="button"
-                                                            className="space-tool del"
-                                                            title="Delete box"
-                                                            onPointerDown={(e) => e.stopPropagation()}
-                                                            onClick={() => deleteSpace(s.id)}
-                                                        >
-                                                            <IconTrash size={13} />
-                                                        </button>
-                                                    </div>
-                                                    <div
-                                                        className="space-resize"
-                                                        title="Resize box"
-                                                        onPointerDown={(e) => startSpaceDrag('resize', s.id, e)}
-                                                    />
-                                                    <div
-                                                        className="space-drag"
-                                                        title="Drag to move box"
-                                                        onPointerDown={(e) => {
-                                                            e.stopPropagation();
-                                                            startSpaceDrag('move', s.id, e);
-                                                        }}
-                                                        onClick={(e) => e.stopPropagation()}
-                                                    />
-                                                </div>
-                                                );
-                                            })}
-                                        </div>
-                                    )}
-                                    {!cropMode && !doodleTool && !manualMode && stage.w > 0 && side !== 'off' && sizePx > 0 && (
-                                        <div
-                                            className="margin-line"
-                                            style={{
-                                                left: `${side === 'left' ? stage.x + sizePx : stage.x + stage.w - sizePx}px`,
-                                                top: stage.y,
-                                                height: stage.h,
-                                            }}
-                                        />
-                                    )}
-                                    {!cropMode && !doodleTool && !manualMode && scaleMode && stage.w > 0 && scaleCm > 0 && (
-                                        <div
-                                            className="scale-overlay"
-                                            style={{ left: stage.x, top: stage.y, width: stage.w, height: stage.h }}
-                                        >
-                                            <div
-                                                className="scale-grid"
-                                                style={{
-                                                    backgroundImage: [
-                                                        `repeating-linear-gradient(to right, rgba(106,50,240,0.05) 0px, rgba(106,50,240,0.05) 1px, transparent 1px, transparent ${scaleMm}px)`,
-                                                        `repeating-linear-gradient(to bottom, rgba(106,50,240,0.05) 0px, rgba(106,50,240,0.05) 1px, transparent 1px, transparent ${scaleMm}px)`,
-                                                        `repeating-linear-gradient(to right, rgba(106,50,240,0.15) 0px, rgba(106,50,240,0.15) 1px, transparent 1px, transparent ${scaleCm}px)`,
-                                                        `repeating-linear-gradient(to bottom, rgba(106,50,240,0.15) 0px, rgba(106,50,240,0.15) 1px, transparent 1px, transparent ${scaleCm}px)`,
-                                                    ].join(', '),
-                                                }}
-                                            />
-                                            <div
-                                                className="scale-axis-x"
-                                                style={{
-                                                    backgroundImage: [
-                                                        `repeating-linear-gradient(to right, rgba(59,42,138,0.08) 0px, rgba(59,42,138,0.08) 1px, transparent 1px, transparent ${scaleMm}px)`,
-                                                        `repeating-linear-gradient(to right, rgba(59,42,138,0.4) 0px, rgba(59,42,138,0.4) 1px, transparent 1px, transparent ${scaleCm}px)`,
-                                                    ].join(', '),
-                                                }}
-                                            >
-                                                {scaleXTicks.map((left, i) => (
-                                                    <span key={i} className="scale-tick-x" style={{ left }}>
-                                                        <b style={left > stage.w - 26 ? { left: 'auto', right: 0 } : undefined}>{i}</b>
-                                                    </span>
-                                                ))}
-                                                {scaleXHalves.map((left, i) => (
-                                                    <span key={`h${i}`} className="scale-tick-h x" style={{ left }} />
-                                                ))}
-                                            </div>
-                                            <div
-                                                className="scale-axis-y"
-                                                style={{
-                                                    backgroundImage: [
-                                                        `repeating-linear-gradient(to bottom, rgba(59,42,138,0.08) 0px, rgba(59,42,138,0.08) 1px, transparent 1px, transparent ${scaleMm}px)`,
-                                                        `repeating-linear-gradient(to bottom, rgba(59,42,138,0.4) 0px, rgba(59,42,138,0.4) 1px, transparent 1px, transparent ${scaleCm}px)`,
-                                                    ].join(', '),
-                                                }}
-                                            >
-                                                {scaleYTicks.map((top, i) => (
-                                                    <span key={i} className="scale-tick-y" style={{ top }}>
-                                                        <b style={top > stage.h - 26 ? { top: 'auto', bottom: 0 } : undefined}>{i}</b>
-                                                    </span>
-                                                ))}
-                                                {scaleYHalves.map((top, i) => (
-                                                    <span key={`h${i}`} className="scale-tick-h y" style={{ top }} />
-                                                ))}
-                                            </div>
-                                            <span className="scale-note">1 cm grid · true scale · {(stage.w / scaleCm).toFixed(1)} × {(stage.h / scaleCm).toFixed(1)} cm</span>
-                                        </div>
-                                    )}
-                                </div>
-                            ) : (
-                                <div className="viewer-empty">
-                                    <div className="hand-line">
-                                        If &nbsp;
-                                        <span className="hand-frac"><span className="num">x</span><span className="bar"></span><span className="den">y</span></span>
-                                        = <span className="hand-frac"><span className="num">b</span><span className="bar"></span><span className="den">y</span></span>
-                                        = <span className="hand-frac"><span className="num">c</span><span className="bar"></span><span className="den">2</span></span>
-                                        , then,
-                                    </div>
-                                    <div className="hand-line">&nbsp;&nbsp;(a + b + c) ( 1/x + 1/y + 1/z ) = 0</div>
-                                    <div className="hand-line"><span className="underline">Sol</span>&nbsp; Let &nbsp;a/x = b/y = c/z = k</div>
-                                    <div className="hand-line">&nbsp;&nbsp;&nbsp;a = kx,&nbsp; b = ky,&nbsp; c = kz</div>
-                                    <div className="hand-line">LHS = (a + b + c) ( 1/x + 1/y + 1/z )</div>
-                                    <div className="hand-line">&nbsp;&nbsp;&nbsp;= k (x + y + z) ( (yz+zx+xy) / xyz )</div>
-                                    <div className="hand-line">&nbsp;&nbsp;&nbsp;= k (x + y + z) ( (xy+yz+zx) / xyz )</div>
-                                    <div className="hand-line">&nbsp;&nbsp;&nbsp;= k (x + y + z) ( (x+y+z) / xyz )</div>
-                                    <div className="hand-line">&nbsp;&nbsp;&nbsp;= k (x + y + z)&sup2; / xyz</div>
-                                    <div className="hand-line">&nbsp;&nbsp;&nbsp;= 0 &nbsp; ( since a/x = b/y = c/z = k = 0 )</div>
-                                </div>
-                            )}
-                        </div>
-                    </div>
                     </div>
 
                     <div className="right-col">

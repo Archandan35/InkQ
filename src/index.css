@@ -912,6 +912,27 @@ label.field-label {
   color: var(--text-faint);
 }
 
+.printer-row.noscan {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.printer-row.noscan:hover,
+.printer-row.noscan.selected {
+  background: transparent;
+}
+
+.status-noscan {
+  background: var(--grey-icon-bg);
+  color: var(--text-faint);
+  border: 1px solid var(--border);
+}
+
+.status-noscan .status-dot-blink {
+  background: var(--text-faint);
+  animation: none;
+}
+
 .printer-row.empty .printer-name {
   color: var(--text-muted);
   font-weight: 500;
@@ -1254,7 +1275,7 @@ label.field-label {
 }
 
 .columns.collapsed .space-content {
-  font-size: clamp(12px, 2.7cqw, 22px);
+  font-size: calc(5px * var(--pxmm, 2.5));
 }
 
 /* Pages list */
@@ -1821,7 +1842,7 @@ label.field-label {
 .space-box {
   pointer-events: auto;
   position: absolute;
-  border: 1.5px dashed rgba(106, 50, 240, 0.85);
+  outline: 1.5px dashed rgba(106, 50, 240, 0.85);
   background: rgba(106, 50, 240, 0.06);
   border-radius: 6px;
   cursor: move;
@@ -1831,7 +1852,7 @@ label.field-label {
 }
 
 .space-box.active {
-  border: 2px solid var(--violet);
+  outline: 2px solid var(--violet);
   background: rgba(106, 50, 240, 0.1);
   box-shadow: 0 0 0 1px rgba(106, 50, 240, 0.25);
 }
@@ -1893,8 +1914,13 @@ label.field-label {
   flex: 1;
   min-height: 0;
   overflow: auto;
-  padding: 8px 0;
-  font-size: clamp(12px, 2.7cqw, 22px);
+  /* Text size is defined in PHYSICAL millimeters so the document is invariant to
+     window width and matches the printed output exactly. --pxmm (doc px per mm,
+     set on the holder = stage.w/210) converts mm to doc px: at stage.w=533 this
+     reproduces the historical 12.7px reference. The size is FIXED and independent
+     of the box: resizing a space box never scales or alters the text. */
+  padding: calc(3.15px * var(--pxmm, 2.5)) 0;
+  font-size: calc(5px * var(--pxmm, 2.5));
   font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
   line-height: 1.5;
   text-align: justify;
@@ -1906,6 +1932,33 @@ label.field-label {
 .space-content:empty::before {
   content: 'Type or paste text...';
   color: var(--text-faint);
+}
+
+/* Line = where the real wrapped text ends (matches what prints). This is
+   NOT the resize handle's position — read this one against the ruler,
+   the resize handle is just the box's max/pin bound and never printed. */
+.space-end-marker {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 0;
+  border-top: 1.5px dashed #16a34a;
+  pointer-events: none;
+  z-index: 2;
+}
+
+.space-end-label {
+  position: absolute;
+  right: 4px;
+  top: 2px;
+  font-size: 10px;
+  font-weight: 700;
+  color: #fff;
+  background: #16a34a;
+  border-radius: 4px;
+  padding: 1px 6px;
+  line-height: 1.5;
+  white-space: nowrap;
 }
 
 .space-tools {

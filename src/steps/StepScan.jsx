@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import Button from '../components/Button.jsx';
-import { listPrinters } from '../services/printerService.js';
+import { listScanners } from '../services/scanService.js';
 import {
   IconCheck,
   IconScanner,
@@ -20,25 +20,26 @@ import {
 export default function StepScan({ selectedPrinter, onSelectPrinter, scanning, onScan, uploading, onUpload, onNext, onBack, canContinue, dpi, onChangeDpi }) {
   const [source, setSource] = useState('scanner');
   const [files, setFiles] = useState([]);
-  const [printers, setPrinters] = useState([]);
+  const [scanners, setScanners] = useState([]);
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [dpiOpen, setDpiOpen] = useState(false);
   const [loadingDevices, setLoadingDevices] = useState(true);
   const [printerError, setPrinterError] = useState(false);
   const [uploadMsg, setUploadMsg] = useState(null);
   const fileInputRef = useRef(null);
+  const workspaceRef = useRef(null);
 
   const DPI_OPTIONS = [100, 150, 300, 600, 900, 1200];
 
-  const onlineCount = printers.filter((p) => p.status === 'online').length;
+  const onlineCount = scanners.filter((s) => s.scannable !== false && s.status === 'online').length;
 
   useEffect(() => {
     let cancelled = false;
 
     const load = async (attempt = 0) => {
-      const { printers, reachable } = await listPrinters();
+      const { scanners, reachable } = await listScanners();
       if (cancelled) return;
-      setPrinters(printers);
+      setScanners(scanners);
       setPrinterError(!reachable);
       setLoadingDevices(false);
       if (!reachable && attempt < 5) {
@@ -51,6 +52,20 @@ export default function StepScan({ selectedPrinter, onSelectPrinter, scanning, o
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    const ws = workspaceRef.current;
+    if (!ws) return;
+    const onBackdropWheel = (e) => {
+      e.preventDefault();
+      ws.scrollTop += e.deltaY;
+    };
+    const backdrops = Array.from(document.querySelectorAll('.dropdown-backdrop'));
+    backdrops.forEach((b) => b.addEventListener('wheel', onBackdropWheel, { passive: false }));
+    return () => {
+      backdrops.forEach((b) => b.removeEventListener('wheel', onBackdropWheel));
+    };
+  }, [dropdownOpen, dpiOpen]);
 
   const handleFiles = async (e) => {
     const list = Array.from(e.target.files || []);
@@ -87,28 +102,28 @@ export default function StepScan({ selectedPrinter, onSelectPrinter, scanning, o
   const handleRefresh = async () => {
     setLoadingDevices(true);
     setPrinterError(false);
-    const { printers, reachable } = await listPrinters();
-    setPrinters(printers);
+    const { scanners, reachable } = await listScanners(true);
+    setScanners(scanners);
     setPrinterError(!reachable);
     setLoadingDevices(false);
   };
 
   const handleRetry = async (id) => {
-    setPrinters((prev) =>
-      prev.map((p) => (p.id === id ? { ...p, status: 'connecting' } : p))
+    setScanners((prev) =>
+      prev.map((s) => (s.id === id ? { ...s, status: 'connecting' } : s))
     );
-    const { printers } = await listPrinters();
-    setPrinters((prev) =>
-      prev.map((p) => {
-        if (p.id !== id) return p;
-        const fresh = printers.find((f) => f.id === id);
-        return { ...p, status: fresh ? fresh.status : 'offline' };
+    const { scanners } = await listScanners(true);
+    setScanners((prev) =>
+      prev.map((s) => {
+        if (s.id !== id) return s;
+        const fresh = scanners.find((f) => f.id === id);
+        return { ...s, status: fresh ? fresh.status : 'offline' };
       })
     );
   };
 
   return (
-    <div className="workspace">
+    <div className="workspace" ref={workspaceRef}>
       <div className="hero">
         <div>
           <h1>Scan &amp; Detect</h1>
@@ -265,7 +280,7 @@ export default function StepScan({ selectedPrinter, onSelectPrinter, scanning, o
                     {!loadingDevices && printerError && (
                       <div className="printer-row empty">
                         <IconPrinter size={15} />
-                        <span className="printer-name">Printer service unreachable — run npm run app</span>
+                        <span className="printer-name">Scanner service unreachable — run npm run app</span>
                         <button
                           type="button"
                           className="retry-btn"
@@ -279,10 +294,10 @@ export default function StepScan({ selectedPrinter, onSelectPrinter, scanning, o
                         </button>
                       </div>
                     )}
-                    {!loadingDevices && !printerError && printers.length === 0 && (
+                    {!loadingDevices && !printerError && scanners.length === 0 && (
                       <div className="printer-row empty">
                         <IconPrinter size={15} />
-                        <span className="printer-name">No printers detected</span>
+                        <span className="printer-name">No scanners detected</span>
                         <button
                           type="button"
                           className="retry-btn"
@@ -296,12 +311,13 @@ export default function StepScan({ selectedPrinter, onSelectPrinter, scanning, o
                         </button>
                       </div>
                     )}
-                    {printers.map((p) => (
+                    {scanners.map((s) => (
                       <div
-                        key={p.id}
-                        className={`printer-row ${selectedPrinter?.id === p.id ? 'selected' : ''}`}
+                        key={s.id}
+                        className={`printer-row ${selectedPrinter?.id === s.id ? 'selected' : ''} ${s.scannable === false ? 'noscan' : ''}`}
                         onClick={() => {
-                          onSelectPrinter(p);
+                          if (s.scannable === false) return;
+                          onSelectPrinter(s);
                           setDropdownOpen(false);
                         }}
                       >
@@ -309,25 +325,27 @@ export default function StepScan({ selectedPrinter, onSelectPrinter, scanning, o
                           <IconRefresh size={14} />
                         </div>
                         <div className="printer-info">
-                          <div className="printer-name">{p.name}</div>
-                          <div className="printer-type">{p.type}</div>
+                          <div className="printer-name">{s.name}</div>
+                          <div className="printer-type">{s.scannable === false ? 'printer — no scanner' : s.type}</div>
                         </div>
                         <div className="printer-status">
-                          <span className={`status-pill status-${p.status}`}>
+                          <span className={`status-pill ${s.scannable === false ? 'status-noscan' : `status-${s.status}`}`}>
                             <span className="status-dot-blink" />
-                            {p.status === 'connecting' ? 'Checking...' : p.status}
+                            {s.scannable === false ? 'No scanner' : s.status === 'connecting' ? 'Checking...' : s.status}
                           </span>
-                          <button
-                            type="button"
-                            className="retry-btn"
-                            title="Retry connection"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              handleRetry(p.id);
-                            }}
-                          >
-                            <IconRefresh size={13} />
-                          </button>
+                          {s.scannable !== false && (
+                            <button
+                              type="button"
+                              className="retry-btn"
+                              title="Retry connection"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleRetry(s.id);
+                              }}
+                            >
+                              <IconRefresh size={13} />
+                            </button>
+                          )}
                         </div>
                       </div>
                     ))}
@@ -369,7 +387,7 @@ export default function StepScan({ selectedPrinter, onSelectPrinter, scanning, o
               variant="primary"
               size="md"
               icon={<IconScanner size={16} strokeWidth={1.8} />}
-              disabled={scanning || !selectedPrinter}
+              disabled={scanning || !selectedPrinter || selectedPrinter.scannable === false}
               onClick={onScan}
             >
               {scanning ? 'Scanning...' : 'Scan Pages'}

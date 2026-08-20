@@ -8,6 +8,7 @@ import {
   realpathSync,
   writeFileSync,
   readFileSync,
+  statSync,
 } from 'node:fs';
 import { writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -39,6 +40,20 @@ try {
   writeFileSync(TOKEN_FILE, AUTH_TOKEN, { mode: 0o600 });
 } catch {
   /* dev proxy token file is best-effort */
+}
+let tokenFileMtime = 0;
+let tokenFileCached = null;
+function currentToken() {
+  try {
+    const st = statSync(TOKEN_FILE);
+    if (st.mtimeMs !== tokenFileMtime) {
+      tokenFileCached = readFileSync(TOKEN_FILE, 'utf8').trim() || AUTH_TOKEN;
+      tokenFileMtime = st.mtimeMs;
+    }
+    return tokenFileCached;
+  } catch {
+    return AUTH_TOKEN;
+  }
 }
 
 const WORKSPACE = path.join(tmpdir(), 'InkQ-workspace');
@@ -130,7 +145,7 @@ app.use('/api', (req, res, next) => {
 });
 
 app.use('/api', (req, res, next) => {
-  if (req.headers['x-inkq-token'] === AUTH_TOKEN) return next();
+  if (req.headers['x-inkq-token'] === currentToken()) return next();
   return res.status(401).json({ error: 'Unauthorized' });
 });
 
@@ -235,6 +250,109 @@ app.get('/api/printers', rateLimit({ windowMs: 60000, max: 30, name: 'printers' 
     .catch(() => res.status(500).json({ error: 'Failed to enumerate printers' }));
 });
 
+function getWiaScanners() {
+  const ps =
+    `$ErrorActionPreference = 'Stop'
+$dm = New-Object -ComObject WIA.DeviceManager
+$results = [System.Collections.Generic.List[object]]::new()
+foreach ($info in $dm.DeviceInfos) {
+  if ($info.Type -ne 1) { continue }
+  $name = ''
+  try { $name = [string]$info.Properties.Item('Name').Value } catch {}
+  if ([string]::IsNullOrWhiteSpace($name)) { continue }
+  $desc = ''
+  try { $desc = [string]$info.Properties.Item('Description').Value } catch {}
+  $results.Add([PSCustomObject]@{ Id = $info.DeviceID; Name = $name; Description = $desc })
+}
+if ($results.Count -eq 0) { Write-Output '[]' } else { $results | ConvertTo-Json -Compress }`;
+  return runPs(['-Command', ps], { timeout: 20000 }).then(({ stdout }) => {
+    const out = (stdout || '').trim();
+    if (!out) return [];
+    const data = JSON.parse(out);
+    const list = Array.isArray(data) ? data : [data];
+    return list.map((s) => ({
+      id: String(s.Id),
+      name: s.Name,
+      type: s.Description || 'scanner',
+      status: 'online',
+    }));
+  });
+}
+
+function tokenSet(name) {
+  return new Set(String(name || '').toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length >= 3));
+}
+
+function sharesModel(a, b) {
+  const sa = tokenSet(a);
+  const sb = tokenSet(b);
+  let shared = 0;
+  for (const t of sa) {
+    if (sb.has(t)) shared += 1;
+  }
+  return shared >= 2;
+}
+
+function connectionLabel(s) {
+  const n = String(s.name || '').toLowerCase();
+  const d = String(s.type || '').toLowerCase();
+  if (n.includes('(usb)')) return 'USB connection';
+  if (n.includes('(net)')) return 'Network (Wi-Fi) connection';
+  if (d.includes('wsd')) return 'Wi-Fi connection (WSD)';
+  return s.type || 'scanner';
+}
+
+function mergeScanners(scanners, printers) {
+  const list = [];
+  for (const s of scanners) {
+    list.push({
+      id: `scanner-${s.id}`,
+      name: s.name,
+      type: connectionLabel(s),
+      status: 'online',
+      scannable: true,
+      scanner: s.name,
+    });
+  }
+  for (const p of printers) {
+    const hasScanner = scanners.some((s) => sharesModel(p.name, s.name));
+    if (hasScanner) continue;
+    list.push({ id: p.id, name: p.name, type: 'printer', status: 'offline', scannable: false, scanner: null });
+  }
+  return list;
+}
+
+let scannersCache = { data: null, at: 0 };
+let scannersInflight = null;
+const SCANNERS_TTL = 20000;
+
+function refreshScannersCache() {
+  if (scannersInflight) return scannersInflight;
+  scannersInflight = Promise.allSettled([getWiaScanners(), getPrinters()])
+    .then(([sc, pr]) => {
+      if (sc.status !== 'fulfilled') throw sc.reason;
+      const printers = pr.status === 'fulfilled' ? pr.value : [];
+      const data = mergeScanners(sc.value, printers);
+      scannersCache = { data, at: Date.now() };
+      return data;
+    })
+    .finally(() => {
+      scannersInflight = null;
+    });
+  return scannersInflight;
+}
+
+app.get('/api/scanners', rateLimit({ windowMs: 60000, max: 60, name: 'scanners' }), (req, res) => {
+  if (!req.query.refresh && scannersCache.data && Date.now() - scannersCache.at < SCANNERS_TTL) {
+    return res.json(scannersCache.data);
+  }
+  refreshScannersCache()
+    .then((data) => res.json(data))
+    .catch(() => res.status(500).json({ error: 'Failed to enumerate scanners' }));
+});
+
+refreshScannersCache().catch(() => {});
+
 const NO_SCANNER = '__INKQ_NO_SCANNER__';
 
 const SCAN_SCRIPT = `
@@ -244,11 +362,8 @@ $dm = New-Object -ComObject WIA.DeviceManager
 $info = $null
 if ($printer) {
   try {
-    $info = $dm.DeviceInfos | Where-Object { $_.Type -eq 1 -and $_.Properties.Item('Name').Value -eq $printer } | Select-Object -First 1
+    $info = $dm.DeviceInfos | Where-Object { $_.Type -eq 1 -and $_.Properties.Item('Name').Value -ieq $printer } | Select-Object -First 1
   } catch {}
-}
-if (-not $info) {
-  $info = $dm.DeviceInfos | Where-Object { $_.Type -eq 1 } | Select-Object -First 1
 }
 if (-not $info) {
   Write-Output '${NO_SCANNER}'
@@ -299,7 +414,7 @@ let scanAborted = false;
 
 app.post('/api/scan', rateLimit({ windowMs: 60000, max: 5, name: 'scan' }), (req, res) => {
   const printer = typeof req.body?.printer === 'string' ? req.body.printer.trim() : null;
-  if (printer && (printer.length > 200 || /[\r\n;|&<>`$()]/.test(printer))) {
+  if (printer && (printer.length > 200 || /[\r\n;|&<>`$]/.test(printer))) {
     return res.status(400).json({ error: 'Invalid printer name' });
   }
   const rawDpi = req.body?.dpi;
@@ -467,7 +582,7 @@ function serveIndex(req, res) {
   try {
     let html = readFileSync(path.join(dist, 'index.html'), 'utf8');
     if (!html.includes('name="inkq-token"')) {
-      html = html.replace('<head>', `<head><meta name="inkq-token" content="${AUTH_TOKEN}">`);
+      html = html.replace('<head>', `<head><meta name="inkq-token" content="${currentToken()}">`);
     }
     res.set('Cache-Control', 'no-store');
     res.type('html').send(html);

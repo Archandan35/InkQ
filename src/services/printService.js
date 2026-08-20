@@ -1,23 +1,23 @@
 import { sanitizeHtml } from './sanitizeHtml.js';
 import { loadImage, composeDataURL } from './imageOps.js';
+import { physicalPageMm } from './pageGeometry.js';
+import { calibrateFraction, compensateHeightMm } from './pageCalibration.js';
 
-const A4_W_MM = 210;
-const A4_H_MM = 297;
-const DEFAULT_TEXT_PX = 13;
+// Text sizing is defined in PHYSICAL millimeters (document units), not screen
+// pixels, so the printed result never depends on the browser window width at
+// print time. The font size is FIXED in millimeters and independent of the box,
+// so resizing a space box never scales or alters the printed text.
+const FONT_MM = 5.0;
+const PAD_MM = 3.15;
 
 const esc = (s) =>
   String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 
 const stripHtml = (html) => String(html || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
 
-function sheetInfo(natW, natH) {
-  const landscape = natH < natW;
-  return {
-    landscape,
-    wMm: landscape ? A4_H_MM : A4_W_MM,
-    hMm: landscape ? A4_W_MM : A4_H_MM,
-  };
-}
+// Orientation/physical-size decision now lives in pageGeometry.js so it can
+// never diverge from what the screen ruler uses.
+const sheetInfo = (natW, natH) => physicalPageMm(natW, natH);
 
 function marginMm(margin) {
   const m = margin || {};
@@ -71,34 +71,19 @@ function scaleContentHtml(html, scale) {
     if (el.style && el.style.fontSize && /px$/i.test(el.style.fontSize)) {
       const mm = parseFloat(el.style.fontSize) * scale;
       el.style.fontSize = `${mm.toFixed(2)}mm`;
-      el.setAttribute('data-mm', mm.toFixed(2));
     }
   }
   return d.innerHTML;
 }
 
-function applyFontFactor(el, factor) {
-  const base = parseFloat(el.getAttribute('data-mm'));
-  if (base) el.style.fontSize = `${(base * factor).toFixed(2)}mm`;
-  el.querySelectorAll('[data-mm]').forEach((c) => {
-    c.style.fontSize = `${(parseFloat(c.getAttribute('data-mm')) * factor).toFixed(2)}mm`;
-  });
+function contentInline() {
+  return `font-size: ${FONT_MM.toFixed(2)}mm; padding: ${PAD_MM.toFixed(2)}mm 0;`;
 }
 
-function fitContent(win) {
-  win.document.querySelectorAll('.space-content').forEach((el) => {
-    if (!el.getAttribute('data-mm')) return;
-    if (el.scrollWidth <= el.clientWidth + 0.5 && el.scrollHeight <= el.clientHeight + 0.5) return;
-    let lo = 0.1;
-    let hi = 1;
-    for (let i = 0; i < 16; i++) {
-      const mid = (lo + hi) / 2;
-      applyFontFactor(el, mid);
-      if (el.scrollWidth <= el.clientWidth + 0.5 && el.scrollHeight <= el.clientHeight + 0.5) lo = mid;
-      else hi = mid;
-    }
-    applyFontFactor(el, lo);
-  });
+function contentWidthMm(s, layerW, ref) {
+  const w = s.width * layerW;
+  const m = ref && ref.spaceWmm ? ref.spaceWmm[s.id] : undefined;
+  return Number.isFinite(m) && m > 0 && m < w ? m : w;
 }
 
 const BASE_CSS = `
@@ -119,7 +104,7 @@ html, body { margin: 0; padding: 0; background: #fff; }
   top: 50%;
   transform: translate(-50%, -50%);
   max-width: none;
-  object-fit: contain;
+  object-fit: fill;
 }
 .space-layer {
   position: absolute;
@@ -181,7 +166,6 @@ function finish(win, frame, after) {
   const print = () => {
     const chain = after ? Promise.resolve().then(after) : Promise.resolve();
     chain.then(() => {
-      fitContent(win);
       win.print();
       const cleanup = () => {
         if (frame && frame.parentNode) frame.parentNode.removeChild(frame);
@@ -191,13 +175,6 @@ function finish(win, frame, after) {
     });
   };
   setTimeout(print, 400);
-}
-
-function contentInline(scale) {
-  return (
-    `font-size: ${(DEFAULT_TEXT_PX * scale).toFixed(2)}mm; ` +
-    `padding: ${(8 * scale).toFixed(2)}mm 0;`
-  );
 }
 
 function cutPad(scale, margin) {
@@ -211,24 +188,22 @@ export async function printScannedOnly(pages) {
   const css = [];
   for (let i = 0; i < pages.length; i++) {
     const img = await loadImage(pages[i].src);
-    const { wMm } = sheetInfo(img.naturalWidth, img.naturalHeight);
+    const { wMm, hMm } = sheetInfo(img.naturalWidth, img.naturalHeight);
     const physWmm = wMm;
-    const physHmm = (img.naturalHeight / img.naturalWidth) * wMm;
-    css.push(`@page print-raw-${i} { size: ${physWmm.toFixed(2)}mm ${physHmm.toFixed(2)}mm; margin: 0; }`);
+    css.push(`@page print-raw-${i} { size: ${physWmm.toFixed(2)}mm ${hMm.toFixed(2)}mm; margin: 0; }`);
   }
   writeBase(win, css.join(''));
   for (let i = 0; i < pages.length; i++) {
     const img = await loadImage(pages[i].src);
-    const { wMm } = sheetInfo(img.naturalWidth, img.naturalHeight);
+    const { wMm, hMm } = sheetInfo(img.naturalWidth, img.naturalHeight);
     const physWmm = wMm;
-    const physHmm = (img.naturalHeight / img.naturalWidth) * wMm;
     win.document.write(
-      `<div class="sheet" style="page: print-raw-${i}; width: ${physWmm.toFixed(2)}mm; height: ${physHmm.toFixed(2)}mm;">` +
-        `<img class="bg" src="${pages[i].src}" style="width: ${physWmm.toFixed(2)}mm; height: ${physHmm.toFixed(2)}mm;" />` +
-        `</div>`
+      `<div class="sheet" style="page: print-raw-${i}; width: ${physWmm.toFixed(2)}mm; height: ${hMm.toFixed(2)}mm;">` +
+      `<img class="bg" src="${pages[i].src}" style="width: ${physWmm.toFixed(2)}mm; height: ${hMm.toFixed(2)}mm;" />` +
+      `</div>`
     );
   }
-  finish(win, frame);
+  finish(win, frame, () => waitImages(win));
 }
 
 export async function printWholePage(pages, spaces, ref, margin) {
@@ -238,25 +213,23 @@ export async function printWholePage(pages, spaces, ref, margin) {
   const css = [];
   for (let i = 0; i < pages.length; i++) {
     const img = await loadImage(pages[i].src);
-    const { wMm } = sheetInfo(img.naturalWidth, img.naturalHeight);
+    const { wMm, hMm } = sheetInfo(img.naturalWidth, img.naturalHeight);
     const physWmm = wMm;
-    const physHmm = (img.naturalHeight / img.naturalWidth) * wMm;
-    css.push(`@page print-page-${i} { size: ${physWmm.toFixed(2)}mm ${physHmm.toFixed(2)}mm; margin: 0; }`);
+    css.push(`@page print-page-${i} { size: ${physWmm.toFixed(2)}mm ${hMm.toFixed(2)}mm; margin: 0; }`);
   }
   writeBase(win, css.join(''));
   for (let i = 0; i < pages.length; i++) {
     const page = pages[i];
     const img = await loadImage(page.src);
-    const { wMm } = sheetInfo(img.naturalWidth, img.naturalHeight);
+    const { wMm, hMm } = sheetInfo(img.naturalWidth, img.naturalHeight);
     const scale = printScale(ref, page, wMm, img.naturalWidth);
     const physWmm = wMm;
-    const physHmm = (img.naturalHeight / img.naturalWidth) * wMm;
     const composed = await composeDataURL(page);
     const pageSpaces = sanitizeSpaces(spaces, page.id);
     const insetWmm = physWmm - mL - mR;
     win.document.write(
-      `<div class="sheet" style="page: print-page-${i}; width: ${physWmm.toFixed(2)}mm; height: ${physHmm.toFixed(2)}mm;">` +
-        `<img class="bg" src="${composed}" style="width: ${physWmm.toFixed(2)}mm; height: ${physHmm.toFixed(2)}mm;" />`
+      `<div class="sheet" style="page: print-page-${i}; width: ${physWmm.toFixed(2)}mm; height: ${hMm.toFixed(2)}mm;">` +
+      `<img class="bg" src="${composed}" style="width: ${physWmm.toFixed(2)}mm; height: ${hMm.toFixed(2)}mm;" />`
     );
     if (pageSpaces.length) {
       const padMm = cutPad(scale, margin);
@@ -264,16 +237,19 @@ export async function printWholePage(pages, spaces, ref, margin) {
       const layerW = Math.max(0, insetWmm - padMm);
       const fontScale = scale * (insetWmm > 0 ? layerW / insetWmm : 1);
       win.document.write(
-        `<div class="space-layer" style="left: ${layerLeft.toFixed(2)}mm; top: 0; width: ${layerW.toFixed(2)}mm; height: ${physHmm.toFixed(2)}mm;">`
+        `<div class="space-layer" style="left: ${layerLeft.toFixed(2)}mm; top: 0; width: ${layerW.toFixed(2)}mm; height: ${hMm.toFixed(2)}mm;">`
       );
       for (const s of pageSpaces) {
         const snap = side !== 'off' && s.pinned !== false;
         const effLeft = snap ? (side === 'left' ? 0 : 1 - s.width) : s.x;
+        const calLeft = calibrateFraction(effLeft, wMm);
+        const calTop = calibrateFraction(s.y, hMm);
+        const heightMm = compensateHeightMm(s.height * hMm);
         const text = scaleContentHtml(s.text, fontScale);
         win.document.write(
-          `<div class="space" style="left: ${(effLeft * 100).toFixed(4)}%; top: ${(s.y * 100).toFixed(4)}%; width: ${(s.width * 100).toFixed(4)}%; height: ${(s.height * 100).toFixed(4)}%;">` +
-            `<div class="space-content" data-mm="${(DEFAULT_TEXT_PX * fontScale).toFixed(2)}" style="${contentInline(fontScale)}">${text}</div>` +
-            `</div>`
+          `<div class="space" style="left: ${(calLeft * 100).toFixed(4)}%; top: ${(calTop * 100).toFixed(4)}%; width: ${(s.width * 100).toFixed(4)}%; height: ${heightMm.toFixed(2)}mm;">` +
+          `<div class="space-content" style="width: ${contentWidthMm(s, layerW, ref).toFixed(2)}mm; ${contentInline()}">${text}</div>` +
+          `</div>`
         );
       }
       win.document.write('</div>');
@@ -307,12 +283,14 @@ export async function printSmartBlocks(pages, spaces, ref, margin) {
       .map(({ s }) => {
         const snap = side !== 'off' && s.pinned !== false;
         const effLeft = snap ? (side === 'left' ? 0 : 1 - s.width) : s.x;
-        const mmX = layerLeft + effLeft * layerW;
-        const mmY = s.y * hMm;
+        const calLeft = calibrateFraction(effLeft, wMm);
+        const calTop = calibrateFraction(s.y, hMm);
+        const mmX = layerLeft + calLeft * layerW;
+        const mmY = calTop * hMm;
         const mmW = s.width * layerW;
-        const mmH = s.height * hMm;
+        const mmH = compensateHeightMm(s.height * hMm);
         const text = scaleContentHtml(s.text, fontScale);
-        return `<div class="space-content" data-mm="${(DEFAULT_TEXT_PX * fontScale).toFixed(2)}" style="position: absolute; left: ${mmX.toFixed(2)}mm; top: ${mmY.toFixed(2)}mm; width: ${mmW.toFixed(2)}mm; height: ${mmH.toFixed(2)}mm; ${contentInline(fontScale)}">${text}</div>`;
+        return `<div class="space-content" style="position: absolute; left: ${mmX.toFixed(2)}mm; top: ${mmY.toFixed(2)}mm; width: ${contentWidthMm(s, layerW, ref).toFixed(2)}mm; height: ${mmH.toFixed(2)}mm; ${contentInline()}">${text}</div>`;
       })
       .join('');
     sheets.push(`<div class="sheet" style="page: print-block-${i}; width: ${wMm}mm; height: ${hMm}mm;">${content}</div>`);

@@ -82,7 +82,7 @@ export default function App() {
     setScanning(true);
     setScanDone(false);
     try {
-      const { url, durationMs } = await scanPage(selectedPrinter?.name, dpi, { signal: ctrl.signal });
+      const { url, durationMs } = await scanPage(selectedPrinter?.scanner || selectedPrinter?.name, dpi, { signal: ctrl.signal });
       addPage(url);
       if (durationMs) setLastScanMs(durationMs);
       setScanDone(true);
@@ -123,7 +123,7 @@ export default function App() {
     setScanning(true);
     setScanDone(false);
     try {
-      const { url, durationMs } = await scanPage(selectedPrinter?.name, dpi, { signal: ctrl.signal });
+      const { url, durationMs } = await scanPage(selectedPrinter?.scanner || selectedPrinter?.name, dpi, { signal: ctrl.signal });
       setPages((prev) => prev.map((p, i) => (i === index ? { id: p.id, src: url } : p)));
       if (durationMs) setLastScanMs(durationMs);
       setScanDone(true);
